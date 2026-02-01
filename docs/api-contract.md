@@ -17,9 +17,10 @@ The Orchestrator exposes two HTTP endpoints:
 
 ## 2. Base URL (Local Development)
 
+```text
 http://localhost:7071
 
-
+```
 ---
 
 ## 3. GET /api/health
@@ -39,6 +40,8 @@ Confirm that the Orchestrator service is running and reachable.
   "status": "ok"
 }
 
+```
+---
 
 ## 4. POST /api/chat
 ### Purpose
@@ -52,21 +55,27 @@ Accept a user question and route it through the orchestration pipeline
  - Route: '/api/chat'
  - Content-Type: 'application/json'
 
-Request Body
+### Request Body
+ ```json
 {
   "message": "How do I reset my VPN client?",
   "requestType": "troubleshooting",
   "userRole": "customer"
 }
+```
 
 ### Fields
-Field	Type	Required	Description
-message	string	Yes	User input question
-requestType	string	Yes	Request category (e.g. troubleshooting, policy, how-to)
-userRole	string	Yes	User role (e.g. customer, agent, admin)
 
-Response (200 OK)
+| Field | Type | Required | Description |
+|------|------|----------|-------------|
+| message | string | Yes | User input question |
+| requestType | string | Yes | Request category (e.g. troubleshooting, policy, how-to) |
+| userRole | string | Yes | User role (e.g. customer, agent, admin) |
 
+
+### Response (200 OK)
+
+```json
 {
   "answer": "Steps to reset your VPN client...",
   "citations": {
@@ -81,21 +90,24 @@ Response (200 OK)
     "reason": ""
   }
 }
+```
 
-
+###  Response Fields
 ### Response Fields
-Field	Type	Description
-answer	string	Final response text
-citations	object	Knowledge sources used (placeholder for now)
-actionHints	object	Internal orchestration hints
-requestId	string	Correlation ID for tracing
-escalation	object	Escalation decision result
+
+| Field | Type | Description |
+|------|------|-------------|
+| answer | string | Final response text returned to the user |
+| citations | object | Knowledge sources used (placeholder for now) |
+| actionHints | object | Internal orchestration hints (placeholder) |
+| requestId | string | Correlation ID for tracing and logging |
+| escalation | object | Escalation decision result |
 
 
 
 ## 5. Versioning Notes
 
-### Current version: v0.1
+###  Current version: v0.1
 
 Retrieval, RBAC filtering, and LLM integration are not yet active
 
