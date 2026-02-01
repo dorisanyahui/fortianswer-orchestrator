@@ -30,11 +30,12 @@ Please install the following tools before starting:
 
 ## Step 1: Clone the Repository
 
-```bash
+
 git clone https://github.com/dorisanyahui/fortianswer-orchestrator.git
 cd fortianswer-orchestrator
 
 ## Step 2: Navigate to the Orchestrator Project
+
 cd src/orchestrator/FortiAnswer.Orchestrator
 
 This folder contains the Azure Function App.
