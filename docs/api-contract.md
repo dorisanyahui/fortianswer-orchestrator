@@ -40,19 +40,17 @@ Confirm that the Orchestrator service is running and reachable.
 }
 
 
-4. POST /api/chat
-Purpose
+## 4. POST /api/chat
+### Purpose
 
 Accept a user question and route it through the orchestration pipeline
 (Retrieval → LLM → Structured Response).
 
-Request
+### Request
 
-Method: POST
-
-Route: /api/chat
-
-Content-Type: application/json
+ - Method: 'POST'
+ - Route: '/api/chat'
+ - Content-Type: 'application/json'
 
 Request Body
 {
@@ -61,7 +59,7 @@ Request Body
   "userRole": "customer"
 }
 
-Fields
+### Fields
 Field	Type	Required	Description
 message	string	Yes	User input question
 requestType	string	Yes	Request category (e.g. troubleshooting, policy, how-to)
@@ -85,7 +83,7 @@ Response (200 OK)
 }
 
 
-Response Fields
+### Response Fields
 Field	Type	Description
 answer	string	Final response text
 citations	object	Knowledge sources used (placeholder for now)
@@ -95,9 +93,9 @@ escalation	object	Escalation decision result
 
 
 
-5. Versioning Notes
+## 5. Versioning Notes
 
-Current version: v0.1
+### Current version: v0.1
 
 Retrieval, RBAC filtering, and LLM integration are not yet active
 

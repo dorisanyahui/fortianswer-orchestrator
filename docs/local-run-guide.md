@@ -34,12 +34,12 @@ Please install the following tools before starting:
 git clone https://github.com/dorisanyahui/fortianswer-orchestrator.git
 cd fortianswer-orchestrator
 
-##Step 2: Navigate to the Orchestrator Project
+## Step 2: Navigate to the Orchestrator Project
 cd src/orchestrator/FortiAnswer.Orchestrator
 
 This folder contains the Azure Function App.
 
-##Step 3: Configure Local Settings
+## Step 3: Configure Local Settings
 Create a local settings file for development.
 cp local.settings.template.json local.settings.json
 
@@ -51,7 +51,7 @@ Do NOT commit this file to GitHub
 
 No real secrets are required at this stage
 
-##tep 4: Start the Function App
+## step 4: Start the Function App
 Run the following command:
 func start
 
@@ -60,7 +60,7 @@ Functions:
   health: [GET] http://localhost:7071/api/health
   chat:   [POST] http://localhost:7071/api/chat
 
-##Step 5: Test the Health Endpoint
+## Step 5: Test the Health Endpoint
 Open a terminal or browser and test:
 curl http://localhost:7071/api/health
 Expected response:
@@ -68,7 +68,7 @@ Expected response:
   "status": "ok"
 }
 
-##Step 6: Test the Chat Endpoint
+## Step 6: Test the Chat Endpoint
 
 Example request using PowerShell:
 
@@ -95,7 +95,7 @@ Expected response (example):
 }
 
 
-##Notes
+## Notes
 
 The current implementation uses placeholder logic
 
@@ -103,7 +103,7 @@ Retrieval (RAG) and LLM integration will be added in later tasks
 
 This setup is sufficient for local development and demo preparation
 
-##Troubleshooting
+## Troubleshooting
 
 If func is not recognized, restart the terminal or VS Code
 
