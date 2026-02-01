@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "FortiAnswer_Orchestrator": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7284",
+      "launchBrowser": false
+    }
+  }
+}
