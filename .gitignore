@@ -1,0 +1,19 @@
+# Windows
+desktop.ini
+Thumbs.db
+
+# local secrets
+local.settings.json
+
+# IDE
+.vs/
+.vscode/
+
+# build outputs (C#)
+bin/
+obj/
+
+# Node/Python (if used later)
+node_modules/
+.venv/
+__pycache__/
