@@ -26,6 +26,9 @@ public sealed class ChatRequest
     /// Optional client-side conversation/thread id
     /// </summary>
     public string? ConversationId { get; set; }
+
+    public bool? ConfirmWebSearch { get; set; }
+    public string? WebSearchToken { get; set; }
 }
 
 /// <summary>
@@ -64,6 +67,9 @@ public sealed class ChatResponse
     public string Answer { get; set; } = "";
     public List<Citation> Citations { get; set; } = new();
     public List<string> ActionHints { get; set; } = new();
+    public bool NeedsWebConfirmation { get; set; }
+    public string? WebSearchToken { get; set; }
+
 
     /// <summary>
     /// Trace id = correlationId (also returned in response header x-correlation-id)
