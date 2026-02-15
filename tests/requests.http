@@ -1,0 +1,88 @@
+@baseUrl = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
+@corrId = doris-test-001
+
+###
+# Health - no correlation id provided (server will generate)
+GET {{baseUrl}}/api/health
+Accept: application/json
+
+###
+# Health - with correlation id (server should echo back)
+GET {{baseUrl}}/api/health
+Accept: application/json
+x-correlation-id: {{corrId}}
+
+###
+# Chat - success (stub)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+{
+  "message": "hello",
+  "requestType": "Public",
+  "userRole": "User"
+}
+
+###
+# Chat - success with correlation id (server should echo back)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+x-correlation-id: {{corrId}}
+
+{
+  "message": "hello",
+  "requestType": "Public",
+  "userRole": "User",
+  "userGroup": "AnyGroup",
+  "conversationId": "conv-001"
+}
+
+###
+# Chat - InvalidJson (expect 400, error.code = InvalidJson)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+{
+
+###
+# Chat - MissingBody (expect 400, error.code = MissingBody OR InvalidJson depending on deserialize behavior)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+
+###
+# Chat - ValidationError missing message (expect 400, details.field=message)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+{
+  "requestType": "Public",
+  "userRole": "User"
+}
+
+###
+# Chat - ValidationError missing requestType (expect 400, details.field=requestType)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+{
+  "message": "hello",
+  "userRole": "User"
+}
+
+###
+# Chat - ValidationError missing userRole (expect 400, details.field=userRole)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+Accept: application/json
+
+{
+  "message": "hello",
+  "requestType": "Public"
+}

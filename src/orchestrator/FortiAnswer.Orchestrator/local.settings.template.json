@@ -1,0 +1,24 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+
+    "ORCH_ENV": "local",
+    "ORCH_LOG_LEVEL": "Information",
+
+    "RETRIEVAL_MODE": "stub",
+    "RETRIEVAL_ENDPOINT": "",
+    "RETRIEVAL_API_KEY": "",
+    "RETRIEVAL_INDEX": "",
+    "RETRIEVAL_TIMEOUT_SECONDS": "15",
+
+    "LLM_MODE": "stub",
+    "LLM_ENDPOINT": "",
+    "LLM_API_KEY": "",
+    "LLM_MODEL": "",
+    "LLM_TIMEOUT_SECONDS": "20",
+
+    "DATA_BOUNDARY_DEFAULT": "Public"
+  }
+}
