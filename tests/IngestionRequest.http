@@ -1,0 +1,90 @@
+@baseUrl = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
+
+@contentType = application/json
+
+Paste your ingest function key here:
+
+@ingestKey = PASTE_FUNCTION_KEY_HERE
+
+0) Ingest without key (should be 401)
+
+POST {{baseUrl}}/api/ingest
+Content-Type: {{contentType}}
+
+{}
+
+1) Default ingest (empty body) -> Prefix=null, MaxFiles=5
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+2) Explicit null prefix + default MaxFiles
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": null
+}
+
+3) Ingest with MaxFiles only
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"maxFiles": 3
+}
+
+4) Ingest with Prefix only (scan a virtual folder / path prefix)
+Example prefix values (you must match your blob naming):
+"kb/"
+"kb/faq/"
+"kb/faq/public/"
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": "kb/faq/public/"
+}
+
+5) Ingest with Prefix + MaxFiles (recommended for controlled runs)
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": "kb/faq/",
+"maxFiles": 10
+}
+
+6) MaxFiles invalid (<=0) -> server will reset to 5
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": "kb/",
+"maxFiles": 0
+}
+
+7) Invalid JSON -> should return 500 or function JSON parse error depending on host behavior
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": "kb/",
+"maxFiles": 5,
+
+8) Unknown fields are ignored by deserializer defaults (should still work)
+
+POST {{baseUrl}}/api/ingest?code={{ingestKey}}
+Content-Type: {{contentType}}
+
+{
+"prefix": "kb/",
+"maxFiles": 2,
+"foo": "bar"
+}

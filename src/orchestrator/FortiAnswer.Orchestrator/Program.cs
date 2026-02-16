@@ -20,6 +20,7 @@ builder.Services.AddHttpClient();
 builder.Services.AddSingleton<WebSearchService>();
 builder.Services.AddSingleton<RetrievalService>();
 builder.Services.AddSingleton<PromptBuilder>();
+builder.Services.AddSingleton<DocxTextExtractor>();
 
 // ------------------------------------------------------------
 // ✅ HTTP-calling services: use Typed HttpClient (关键)
@@ -27,6 +28,8 @@ builder.Services.AddSingleton<PromptBuilder>();
 
 builder.Services.AddHttpClient<IEmbeddingService, OpenAiEmbeddingService>();
 builder.Services.AddHttpClient<AzureAiSearchIngestService>();
+builder.Services.AddHttpClient<PdfTextExtractor>();
+
 
 
 // GroqClient uses IHttpClientFactory -> use Singleton (NOT typed client)

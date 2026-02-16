@@ -2,6 +2,17 @@ namespace FortiAnswer.Orchestrator.Services;
 
 public sealed class PromptBuilder
 {
+    // Wrapper to match ChatFunction.cs call-site
+    public string BuildPrompt(
+        string userMessage,
+        string requestType,
+        string userRole,
+        string? userGroup,
+        string? conversationId,
+        string internalContext,
+        string? webContext)
+        => Build(userMessage, requestType, userRole, userGroup, conversationId, internalContext, webContext);
+
     public string Build(
         string userMessage,
         string requestType,
@@ -11,7 +22,6 @@ public sealed class PromptBuilder
         string internalContext,
         string? webContext)
     {
-        // For Step 1 we won’t call Groq yet, but we prepare a final prompt format.
         return $"""
 You are FortiAnswer, an enterprise support assistant.
 

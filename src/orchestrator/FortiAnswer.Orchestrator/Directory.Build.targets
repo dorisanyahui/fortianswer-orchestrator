@@ -1,0 +1,35 @@
+<Project>
+
+  <!-- PROBE：确保你能在 build 输出里看到它真的被导入 -->
+  <Target Name="PROBE_WX_DBT" BeforeTargets="Build">
+    <Message Importance="high" Text="PROBE_WX_DBT: Imported for $(MSBuildProjectName) TargetDir=$(TargetDir)" />
+  </Target>
+
+  <PropertyGroup>
+    <ProtectedDataVersionForWX>4.5.0</ProtectedDataVersionForWX>
+  </PropertyGroup>
+
+  <Target Name="WX_EnsureProtectedDataDll"
+          Condition="'$(MSBuildProjectName)' == 'WorkerExtensions'"
+          BeforeTargets="_FunctionsPostBuildCopyFiles">
+
+    <PropertyGroup>
+      <ProtectedDataDllFromNuGet>$(NuGetPackageRoot)system.security.cryptography.protecteddata\$(ProtectedDataVersionForWX)\runtimes\win\lib\netstandard2.0\System.Security.Cryptography.ProtectedData.dll</ProtectedDataDllFromNuGet>
+      <ProtectedDataOutDir>$(TargetDir)runtimes\win\lib\netstandard2.0\</ProtectedDataOutDir>
+      <ProtectedDataOutFile>$(ProtectedDataOutDir)System.Security.Cryptography.ProtectedData.dll</ProtectedDataOutFile>
+    </PropertyGroup>
+
+    <Message Importance="high" Text="[WX] Copy ProtectedData.dll: From=$(ProtectedDataDllFromNuGet) To=$(ProtectedDataOutFile)" />
+
+    <MakeDir Directories="$(ProtectedDataOutDir)" Condition="!Exists('$(ProtectedDataOutDir)')" />
+
+    <Copy SourceFiles="$(ProtectedDataDllFromNuGet)"
+          DestinationFiles="$(ProtectedDataOutFile)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(ProtectedDataDllFromNuGet)')" />
+
+    <Error Text="[WX] ProtectedData.dll not found at: $(ProtectedDataDllFromNuGet)"
+           Condition="!Exists('$(ProtectedDataDllFromNuGet)')" />
+  </Target>
+
+</Project>

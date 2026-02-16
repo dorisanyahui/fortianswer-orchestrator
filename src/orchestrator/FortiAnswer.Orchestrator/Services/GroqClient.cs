@@ -14,6 +14,10 @@ public sealed class GroqClient
         _httpFactory = httpFactory;
     }
 
+    // Wrapper to match ChatFunction.cs call-site
+    public Task<string> ChatAsync(string prompt, string correlationId)
+        => GenerateAsync(prompt, correlationId);
+
     public async Task<string> GenerateAsync(string prompt, string correlationId)
     {
         var apiKey = Environment.GetEnvironmentVariable("GROQ_API_KEY");
@@ -22,7 +26,6 @@ public sealed class GroqClient
 
         var model = Environment.GetEnvironmentVariable("GROQ_MODEL") ?? "llama-3.3-70b-versatile";
         Console.WriteLine($"[groq.model] using model={model}");
-
 
         var client = _httpFactory.CreateClient();
         client.BaseAddress = new Uri("https://api.groq.com/openai/v1/");
@@ -52,7 +55,6 @@ public sealed class GroqClient
 
         if (!resp.IsSuccessStatusCode)
         {
-            // Log provider error body for debugging (do not leak to end-user)
             Console.WriteLine($"[groq.error] status={(int)resp.StatusCode} body={json}");
 
             if (resp.StatusCode == (HttpStatusCode)429)
