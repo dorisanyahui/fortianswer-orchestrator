@@ -45,17 +45,21 @@ public sealed class ChatFunction
         _groq = groq;
     }
 
+    // ✅ authLevel changed to Anonymous
     [Function("chat")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat")] HttpRequestData req)
     {
-        var correlationId = GetOrCreateCorrelationId(req);
+        // (3) Server-generated request id; keep client correlation id separately
+        var clientCorrelationId = GetClientCorrelationId(req);
+        var requestId = Guid.NewGuid().ToString("N");
 
         try
         {
+            // 1) Read body
             var bodyText = await new StreamReader(req.Body).ReadToEndAsync();
             if (string.IsNullOrWhiteSpace(bodyText))
-                return await BadRequest(req, correlationId, "MissingBody", "Request body is required.");
+                return await BadRequest(req, requestId, clientCorrelationId, "MissingBody", "Request body is required.");
 
             ChatRequest? body;
             try
@@ -64,50 +68,56 @@ public sealed class ChatFunction
             }
             catch
             {
-                return await BadRequest(req, correlationId, "InvalidJson", "Invalid JSON body.");
+                return await BadRequest(req, requestId, clientCorrelationId, "InvalidJson", "Invalid JSON body.");
             }
 
+            // 2) Validate
             var message = body?.Message?.Trim();
             if (string.IsNullOrWhiteSpace(message))
-                return await BadRequest(req, correlationId, "ValidationError", "Field 'message' is required.", new { field = "message" });
+                return await BadRequest(req, requestId, clientCorrelationId, "ValidationError", "Field 'message' is required.", new { field = "message" });
 
             var requestType = (body?.RequestType ?? Environment.GetEnvironmentVariable("DATA_BOUNDARY_DEFAULT") ?? "Public").Trim();
             var userRole = (body?.UserRole ?? "User").Trim();
             var userGroup = body?.UserGroup;
             var conversationId = body?.ConversationId;
 
+            // TopK config
             var internalTopK = ReadTopK("INTERNAL_TOPK", 2, 1, 10);
             var webTopK = ReadTopK("WEB_TOPK", 3, 1, 10);
 
             var actionHints = new List<string>
             {
                 $"cfg:internalTopK={internalTopK}",
-                $"cfg:webTopK={webTopK}"
+                $"cfg:webTopK={webTopK}",
+                $"serverRequestId={requestId}"
             };
 
-            // -------- 1) Internal retrieval (object, not dynamic) --------
+            if (!string.IsNullOrWhiteSpace(clientCorrelationId))
+                actionHints.Add($"clientCorrelationId={clientCorrelationId}");
+
+            // 3) Internal retrieval (object, not dynamic)
             object internalBundle = await _retrieval.RetrieveAsync(
                 question: message!,
                 requestType: requestType,
                 userGroup: userGroup,
                 topK: internalTopK,
-                correlationId: correlationId
+                correlationId: requestId
             );
 
             var internalContext = ExtractString(internalBundle, "Context") ?? "";
-            var internalCitations = ExtractCitations(internalBundle, "Citations");
+            var internalCitationsRaw = ExtractCitations(internalBundle, "Citations");
 
-            actionHints.Add(internalCitations.Count > 0 ? "used:internal_search" : "used:internal_search_empty");
+            actionHints.Add(internalCitationsRaw.Count > 0 ? "used:internal_search" : "used:internal_search_empty");
 
-            // -------- 2) Need web? --------
+            // 4) Decide if internal evidence is insufficient/off-topic
             double minScore = GetDoubleEnv("SEARCH_MIN_SCORE", 0.01);
-            double bestScore = GetBestScore(internalCitations);
+            double bestScore = GetBestScore(internalCitationsRaw);
 
             var internalTextForOverlap =
                 internalContext + "\n\n" +
-                string.Join("\n\n", internalCitations.ConvertAll(c => c.Snippet ?? ""));
+                string.Join("\n\n", internalCitationsRaw.ConvertAll(c => c.Snippet ?? ""));
 
-            bool noEvidence = internalCitations.Count == 0;
+            bool noEvidence = internalCitationsRaw.Count == 0;
             bool weakEvidence = !noEvidence && bestScore < minScore;
             bool lowOverlap = IsLowOverlap(message!, internalTextForOverlap, minOverlap: 2);
 
@@ -117,7 +127,15 @@ public sealed class ChatFunction
 
             bool needWeb = noEvidence || weakEvidence || lowOverlap;
 
-            // -------- 3) Web enablement --------
+            // (1) Filter off-topic internal citations
+            var internalCitationsFiltered = (lowOverlap || weakEvidence)
+                ? new List<Citation>()
+                : internalCitationsRaw;
+
+            if (lowOverlap || weakEvidence)
+                actionHints.Add("internal:citations_filtered=true");
+
+            // 5) Web enablement
             bool isPublic = string.Equals(requestType, "Public", StringComparison.OrdinalIgnoreCase);
             var webMode = (Environment.GetEnvironmentVariable("WEBSEARCH_MODE") ?? "off").Trim().ToLowerInvariant();
             bool webEnabled = isPublic && webMode == "tavily" && IsTavilyConfigured();
@@ -125,24 +143,24 @@ public sealed class ChatFunction
             object? webBundle = null;
             string? webContext = null;
 
-            var mergedCitations = new List<Citation>(internalCitations);
+            var mergedCitations = new List<Citation>(internalCitationsFiltered);
 
-            // Step 1: ask confirmation
+            // Step 1: need web but not confirmed => ask
             if (needWeb && webEnabled && body?.ConfirmWebSearch != true)
             {
                 actionHints.Add("next:ask_user_for_web_search");
 
-                var token = MakeWebConfirmToken(message!, correlationId);
+                var token = MakeWebConfirmToken(message!, requestId);
 
                 var payloadAsk = new ChatResponse
                 {
                     Answer =
-                        "内部知识库没有找到足够相关的证据来回答该问题。\n" +
-                        "是否需要我进行联网 Web Search（Tavily）来补充信息？\n\n" +
-                        "如果需要，请在下一次请求里传 confirmWebSearch=true，并带上 webSearchToken。",
+                        "Internal knowledge base did not return enough relevant evidence to answer this question.\n" +
+                        "Would you like me to run a Web Search (Tavily) to supplement the answer?\n\n" +
+                        "If yes, resend the request with confirmWebSearch=true and include webSearchToken.",
                     Citations = mergedCitations,
                     ActionHints = actionHints,
-                    RequestId = correlationId,
+                    RequestId = requestId,
                     NeedsWebConfirmation = true,
                     WebSearchToken = token,
                     Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
@@ -153,30 +171,31 @@ public sealed class ChatFunction
                     }
                 };
 
-                return await Ok(req, correlationId, payloadAsk);
+                return await Ok(req, requestId, clientCorrelationId, payloadAsk);
             }
 
-            // Step 2: confirmed -> validate token -> run web search
+            // Step 2: confirmed => validate token => run web search
             if (needWeb && webEnabled && body?.ConfirmWebSearch == true)
             {
                 if (string.IsNullOrWhiteSpace(body.WebSearchToken))
-                    return await BadRequest(req, correlationId, "ValidationError",
+                    return await BadRequest(req, requestId, clientCorrelationId, "ValidationError",
                         "Field 'webSearchToken' is required when confirmWebSearch=true.",
                         new { field = "webSearchToken" });
 
                 if (!ValidateWebConfirmToken(body.WebSearchToken!, message!))
-                    return await BadRequest(req, correlationId, "ValidationError",
+                    return await BadRequest(req, requestId, clientCorrelationId, "ValidationError",
                         "Invalid or expired webSearchToken.",
                         new { field = "webSearchToken" });
 
                 webBundle = await _webSearch.SearchAsync(
                     query: message!,
                     topK: webTopK,
-                    correlationId: correlationId
+                    correlationId: requestId
                 );
 
                 webContext = ExtractString(webBundle, "Context");
                 var webCitations = ExtractCitations(webBundle, "Citations");
+
                 if (webCitations.Count > 0)
                     mergedCitations.AddRange(webCitations);
 
@@ -187,8 +206,8 @@ public sealed class ChatFunction
                 actionHints.Add(needWeb ? "web_disabled_or_not_allowed" : "next:optional_web_search");
             }
 
-            // -------- 4) Prompt + Groq --------
-            var prompt = _promptBuilder.Build(
+            // 6) Build prompt (plus guardrails)
+            var basePrompt = _promptBuilder.Build(
                 userMessage: message!,
                 requestType: requestType,
                 userRole: userRole,
@@ -198,14 +217,27 @@ public sealed class ChatFunction
                 webContext: webContext
             );
 
-            var answer = await _groq.GenerateAsync(prompt, correlationId) ?? "";
+            // (2) Add source-grounding + timeline consistency rules
+            var guardrails =
+                "\n\n=== RESPONSE RULES (IMPORTANT) ===\n" +
+                "1) Use only facts supported by the provided citations (especially dates, versions, affected products, and mitigations).\n" +
+                "2) If a detail is not supported by citations, say \"Not confirmed by sources\" and do not guess.\n" +
+                "3) If you include a timeline, label each entry as one of: discovered / reported / removed / patched, and keep the timeline internally consistent.\n" +
+                "4) Prefer concise, actionable mitigations.\n" +
+                "=== END RULES ===\n";
 
+            var prompt = basePrompt + guardrails;
+
+            // 7) Groq generate
+            var answer = await _groq.GenerateAsync(prompt, requestId) ?? "";
+
+            // 8) Response
             var payload = new ChatResponse
             {
                 Answer = answer,
                 Citations = mergedCitations,
                 ActionHints = actionHints,
-                RequestId = correlationId,
+                RequestId = requestId,
                 NeedsWebConfirmation = false,
                 WebSearchToken = null,
                 Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
@@ -216,16 +248,16 @@ public sealed class ChatFunction
                 }
             };
 
-            return await Ok(req, correlationId, payload);
+            return await Ok(req, requestId, clientCorrelationId, payload);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "ChatFunction failed. correlationId={correlationId}", correlationId);
-            return await InternalError(req, correlationId, "InternalError", "Unexpected error.");
+            _log.LogError(ex, "ChatFunction failed. requestId={requestId} clientCorrelationId={clientCorrelationId}", requestId, clientCorrelationId);
+            return await InternalError(req, requestId, clientCorrelationId, "InternalError", "Unexpected error.");
         }
     }
 
-    // ---------------- reflection helpers (no dynamic LINQ) ----------------
+    // ---------------- Reflection helpers (no dynamic LINQ) ----------------
 
     private static string? ExtractString(object? obj, string propertyName)
     {
@@ -273,7 +305,7 @@ public sealed class ChatFunction
         }
         catch
         {
-            // ignore
+            // ignore and return empty
         }
 
         return list;
@@ -281,11 +313,14 @@ public sealed class ChatFunction
 
     // ---------------- HTTP helpers ----------------
 
-    private static async Task<HttpResponseData> Ok(HttpRequestData req, string requestId, object payload)
+    private static async Task<HttpResponseData> Ok(HttpRequestData req, string requestId, string? clientCorrelationId, object payload)
     {
         var resp = req.CreateResponse(HttpStatusCode.OK);
         resp.Headers.Add("Content-Type", "application/json");
         resp.Headers.Add("x-correlation-id", requestId);
+        if (!string.IsNullOrWhiteSpace(clientCorrelationId))
+            resp.Headers.Add("x-client-correlation-id", clientCorrelationId);
+
         await resp.WriteStringAsync(JsonSerializer.Serialize(payload, JsonOut));
         return resp;
     }
@@ -293,6 +328,7 @@ public sealed class ChatFunction
     private static async Task<HttpResponseData> BadRequest(
         HttpRequestData req,
         string requestId,
+        string? clientCorrelationId,
         string code,
         string message,
         object? details = null)
@@ -300,6 +336,8 @@ public sealed class ChatFunction
         var resp = req.CreateResponse(HttpStatusCode.BadRequest);
         resp.Headers.Add("Content-Type", "application/json");
         resp.Headers.Add("x-correlation-id", requestId);
+        if (!string.IsNullOrWhiteSpace(clientCorrelationId))
+            resp.Headers.Add("x-client-correlation-id", clientCorrelationId);
 
         var payload = new ErrorResponse
         {
@@ -314,12 +352,15 @@ public sealed class ChatFunction
     private static async Task<HttpResponseData> InternalError(
         HttpRequestData req,
         string requestId,
+        string? clientCorrelationId,
         string code,
         string message)
     {
         var resp = req.CreateResponse(HttpStatusCode.InternalServerError);
         resp.Headers.Add("Content-Type", "application/json");
         resp.Headers.Add("x-correlation-id", requestId);
+        if (!string.IsNullOrWhiteSpace(clientCorrelationId))
+            resp.Headers.Add("x-client-correlation-id", clientCorrelationId);
 
         var payload = new ErrorResponse
         {
@@ -331,16 +372,16 @@ public sealed class ChatFunction
         return resp;
     }
 
-    // ---------------- misc helpers ----------------
+    // ---------------- Correlation / env ----------------
 
-    private static string GetOrCreateCorrelationId(HttpRequestData req)
+    private static string? GetClientCorrelationId(HttpRequestData req)
     {
         if (req.Headers.TryGetValues("x-correlation-id", out var vals))
         {
             var v = vals?.FirstOrDefault();
             if (!string.IsNullOrWhiteSpace(v)) return v!;
         }
-        return Guid.NewGuid().ToString("N");
+        return null;
     }
 
     private static int ReadTopK(string envName, int defaultValue, int min = 1, int max = 10)
@@ -360,6 +401,8 @@ public sealed class ChatFunction
         var v = (Environment.GetEnvironmentVariable(name) ?? "").Trim();
         return double.TryParse(v, out var n) ? n : defaultValue;
     }
+
+    // ---------------- Evidence quality heuristics ----------------
 
     private static double ParseScoreFromSnippet(string? snippet)
     {
@@ -412,12 +455,15 @@ public sealed class ChatFunction
         return !string.IsNullOrWhiteSpace(apiKey) && !apiKey.Contains("<");
     }
 
-    // --- token helpers (same logic) ---
-    private static string MakeWebConfirmToken(string message, string correlationId)
+    // ---------------- Web confirmation token (HMAC) ----------------
+    // Env: WEBSEARCH_CONFIRM_SECRET
+    // Token: base64url(payloadJson) + "." + base64url(hmacSha256(payloadJson))
+    // payloadJson: {"exp":<unixSeconds>,"mh":"<sha256(message)>"}
+    private static string MakeWebConfirmToken(string message, string requestId)
     {
         var secret = (Environment.GetEnvironmentVariable("WEBSEARCH_CONFIRM_SECRET") ?? "").Trim();
         if (string.IsNullOrWhiteSpace(secret))
-            secret = "fallback-" + correlationId;
+            secret = "fallback-" + requestId;
 
         var exp = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
         var mh = Sha256Hex(message);
