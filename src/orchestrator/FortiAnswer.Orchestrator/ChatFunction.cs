@@ -1,288 +1,493 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
 using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 
-namespace FortiAnswer.Orchestrator
+using FortiAnswer.Orchestrator.Models;
+using FortiAnswer.Orchestrator.Services;
+
+namespace FortiAnswer.Orchestrator;
+
+public sealed class ChatFunction
 {
-    public sealed class ChatFunction
+    private readonly ILogger _log;
+    private readonly RetrievalService _retrieval;
+    private readonly WebSearchService _webSearch;
+    private readonly PromptBuilder _promptBuilder;
+    private readonly GroqClient _groq;
+
+    private static readonly JsonSerializerOptions JsonIn = new()
     {
-        private readonly ILogger _log;
-        private readonly IHttpClientFactory _httpClientFactory;
+        PropertyNameCaseInsensitive = true
+    };
 
-        // Keep these as object so DI wiring doesn't break even if types/methods changed.
-        // We intentionally do NOT call missing methods like PromptBuilder.BuildPrompt or GroqClient.ChatAsync.
-        private readonly object? _groqClient;
-        private readonly object? _retrievalService;
-        private readonly object? _promptBuilder;
+    private static readonly JsonSerializerOptions JsonOut = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true
+    };
 
-        private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+    public ChatFunction(
+        ILoggerFactory loggerFactory,
+        RetrievalService retrieval,
+        WebSearchService webSearch,
+        PromptBuilder promptBuilder,
+        GroqClient groq)
+    {
+        _log = loggerFactory.CreateLogger<ChatFunction>();
+        _retrieval = retrieval;
+        _webSearch = webSearch;
+        _promptBuilder = promptBuilder;
+        _groq = groq;
+    }
+
+    [Function("chat")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat")] HttpRequestData req)
+    {
+        var correlationId = GetOrCreateCorrelationId(req);
+
+        try
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            WriteIndented = true
-        };
+            var bodyText = await new StreamReader(req.Body).ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(bodyText))
+                return await BadRequest(req, correlationId, "MissingBody", "Request body is required.");
 
-        public ChatFunction(
-            ILoggerFactory loggerFactory,
-            IHttpClientFactory httpClientFactory,
-            object? groqClient = null,
-            object? retrievalService = null,
-            object? promptBuilder = null)
-        {
-            _log = loggerFactory.CreateLogger<ChatFunction>();
-            _httpClientFactory = httpClientFactory;
-
-            _groqClient = groqClient;
-            _retrievalService = retrievalService;
-            _promptBuilder = promptBuilder;
-        }
-
-        [Function("chat")]
-        public async Task<HttpResponseData> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "post", Route = "chat")] HttpRequestData req,
-            CancellationToken ct)
-        {
+            ChatRequest? body;
             try
             {
-                var body = await ReadBodyAsync(req, ct);
-                var chatReq = JsonSerializer.Deserialize<ChatRequest>(body, JsonOpts);
+                body = JsonSerializer.Deserialize<ChatRequest>(bodyText, JsonIn);
+            }
+            catch
+            {
+                return await BadRequest(req, correlationId, "InvalidJson", "Invalid JSON body.");
+            }
 
-                if (chatReq is null || string.IsNullOrWhiteSpace(chatReq.Message))
+            var message = body?.Message?.Trim();
+            if (string.IsNullOrWhiteSpace(message))
+                return await BadRequest(req, correlationId, "ValidationError", "Field 'message' is required.", new { field = "message" });
+
+            var requestType = (body?.RequestType ?? Environment.GetEnvironmentVariable("DATA_BOUNDARY_DEFAULT") ?? "Public").Trim();
+            var userRole = (body?.UserRole ?? "User").Trim();
+            var userGroup = body?.UserGroup;
+            var conversationId = body?.ConversationId;
+
+            var internalTopK = ReadTopK("INTERNAL_TOPK", 2, 1, 10);
+            var webTopK = ReadTopK("WEB_TOPK", 3, 1, 10);
+
+            var actionHints = new List<string>
+            {
+                $"cfg:internalTopK={internalTopK}",
+                $"cfg:webTopK={webTopK}"
+            };
+
+            // -------- 1) Internal retrieval (object, not dynamic) --------
+            object internalBundle = await _retrieval.RetrieveAsync(
+                question: message!,
+                requestType: requestType,
+                userGroup: userGroup,
+                topK: internalTopK,
+                correlationId: correlationId
+            );
+
+            var internalContext = ExtractString(internalBundle, "Context") ?? "";
+            var internalCitations = ExtractCitations(internalBundle, "Citations");
+
+            actionHints.Add(internalCitations.Count > 0 ? "used:internal_search" : "used:internal_search_empty");
+
+            // -------- 2) Need web? --------
+            double minScore = GetDoubleEnv("SEARCH_MIN_SCORE", 0.01);
+            double bestScore = GetBestScore(internalCitations);
+
+            var internalTextForOverlap =
+                internalContext + "\n\n" +
+                string.Join("\n\n", internalCitations.ConvertAll(c => c.Snippet ?? ""));
+
+            bool noEvidence = internalCitations.Count == 0;
+            bool weakEvidence = !noEvidence && bestScore < minScore;
+            bool lowOverlap = IsLowOverlap(message!, internalTextForOverlap, minOverlap: 2);
+
+            actionHints.Add($"internal:bestScore={bestScore:0.###}");
+            actionHints.Add($"internal:minScore={minScore:0.###}");
+            actionHints.Add($"internal:lowOverlap={(lowOverlap ? "true" : "false")}");
+
+            bool needWeb = noEvidence || weakEvidence || lowOverlap;
+
+            // -------- 3) Web enablement --------
+            bool isPublic = string.Equals(requestType, "Public", StringComparison.OrdinalIgnoreCase);
+            var webMode = (Environment.GetEnvironmentVariable("WEBSEARCH_MODE") ?? "off").Trim().ToLowerInvariant();
+            bool webEnabled = isPublic && webMode == "tavily" && IsTavilyConfigured();
+
+            object? webBundle = null;
+            string? webContext = null;
+
+            var mergedCitations = new List<Citation>(internalCitations);
+
+            // Step 1: ask confirmation
+            if (needWeb && webEnabled && body?.ConfirmWebSearch != true)
+            {
+                actionHints.Add("next:ask_user_for_web_search");
+
+                var token = MakeWebConfirmToken(message!, correlationId);
+
+                var payloadAsk = new ChatResponse
                 {
-                    return await WriteJsonAsync(req, HttpStatusCode.BadRequest, new ErrorResponse
+                    Answer =
+                        "内部知识库没有找到足够相关的证据来回答该问题。\n" +
+                        "是否需要我进行联网 Web Search（Tavily）来补充信息？\n\n" +
+                        "如果需要，请在下一次请求里传 confirmWebSearch=true，并带上 webSearchToken。",
+                    Citations = mergedCitations,
+                    ActionHints = actionHints,
+                    RequestId = correlationId,
+                    NeedsWebConfirmation = true,
+                    WebSearchToken = token,
+                    Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
+                    Mode = new ModeInfo
                     {
-                        Error = "Invalid request. Expecting JSON with at least: { \"message\": \"...\" }"
-                    }, ct);
-                }
-
-                // Optional internal retrieval: we keep it non-breaking (no compile-time dependency).
-                // If your RetrievalService has a known method you want to call, you can wire it back later.
-                var sources = new List<SourceItem>();
-                var contextText = string.Empty;
-
-                // Build prompt/messages (simple + robust)
-                var system = string.IsNullOrWhiteSpace(chatReq.SystemPrompt)
-                    ? "You are a helpful assistant. Answer clearly and cite sources if provided."
-                    : chatReq.SystemPrompt.Trim();
-
-                var userMessage = chatReq.Message.Trim();
-
-                if (!string.IsNullOrWhiteSpace(contextText))
-                {
-                    userMessage =
-                        "Use the following context to answer. If context is insufficient, say so.\n\n" +
-                        "CONTEXT:\n" + contextText + "\n\n" +
-                        "QUESTION:\n" + userMessage;
-                }
-
-                // ✅ FIX: Do NOT call _groqClient.ChatAsync (missing). Use Groq OpenAI-compatible REST.
-                var answer = await CallGroqChatCompletionsAsync(
-                    systemPrompt: system,
-                    userPrompt: userMessage,
-                    temperature: chatReq.Temperature ?? 0.2,
-                    maxTokens: chatReq.MaxTokens ?? 600,
-                    ct: ct);
-
-                var resp = new ChatResponse
-                {
-                    Answer = answer ?? string.Empty,
-                    Sources = sources
+                        Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                        Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                    }
                 };
 
-                return await WriteJsonAsync(req, HttpStatusCode.OK, resp, ct);
+                return await Ok(req, correlationId, payloadAsk);
             }
-            catch (JsonException jex)
+
+            // Step 2: confirmed -> validate token -> run web search
+            if (needWeb && webEnabled && body?.ConfirmWebSearch == true)
             {
-                _log.LogWarning(jex, "Invalid JSON.");
-                return await WriteJsonAsync(req, HttpStatusCode.BadRequest, new ErrorResponse
-                {
-                    Error = "Invalid JSON format."
-                }, ct);
+                if (string.IsNullOrWhiteSpace(body.WebSearchToken))
+                    return await BadRequest(req, correlationId, "ValidationError",
+                        "Field 'webSearchToken' is required when confirmWebSearch=true.",
+                        new { field = "webSearchToken" });
+
+                if (!ValidateWebConfirmToken(body.WebSearchToken!, message!))
+                    return await BadRequest(req, correlationId, "ValidationError",
+                        "Invalid or expired webSearchToken.",
+                        new { field = "webSearchToken" });
+
+                webBundle = await _webSearch.SearchAsync(
+                    query: message!,
+                    topK: webTopK,
+                    correlationId: correlationId
+                );
+
+                webContext = ExtractString(webBundle, "Context");
+                var webCitations = ExtractCitations(webBundle, "Citations");
+                if (webCitations.Count > 0)
+                    mergedCitations.AddRange(webCitations);
+
+                actionHints.Add("used:web_search");
             }
-            catch (Exception ex)
+            else
             {
-                _log.LogError(ex, "ChatFunction failed.");
-                return await WriteJsonAsync(req, HttpStatusCode.InternalServerError, new ErrorResponse
-                {
-                    Error = "Internal server error.",
-                    Detail = ex.Message
-                }, ct);
+                actionHints.Add(needWeb ? "web_disabled_or_not_allowed" : "next:optional_web_search");
             }
-        }
 
-        private async Task<string?> CallGroqChatCompletionsAsync(
-            string systemPrompt,
-            string userPrompt,
-            double temperature,
-            int maxTokens,
-            CancellationToken ct)
-        {
-            var apiKey = Environment.GetEnvironmentVariable("GROQ_API_KEY");
-            if (string.IsNullOrWhiteSpace(apiKey))
-                throw new InvalidOperationException("Missing environment variable: GROQ_API_KEY");
+            // -------- 4) Prompt + Groq --------
+            var prompt = _promptBuilder.Build(
+                userMessage: message!,
+                requestType: requestType,
+                userRole: userRole,
+                userGroup: userGroup,
+                conversationId: conversationId,
+                internalContext: internalContext,
+                webContext: webContext
+            );
 
-            var model = Environment.GetEnvironmentVariable("GROQ_MODEL");
-            if (string.IsNullOrWhiteSpace(model))
-                model = "llama-3.3-70b-versatile";
+            var answer = await _groq.GenerateAsync(prompt, correlationId) ?? "";
 
-            // Groq OpenAI-compatible endpoint
-            var url = Environment.GetEnvironmentVariable("GROQ_BASE_URL");
-            if (string.IsNullOrWhiteSpace(url))
-                url = "https://api.groq.com/openai/v1/chat/completions";
-
-            var payload = new GroqChatCompletionsRequest
+            var payload = new ChatResponse
             {
-                Model = model,
-                Temperature = temperature,
-                MaxTokens = maxTokens,
-                Messages = new List<GroqMessage>
+                Answer = answer,
+                Citations = mergedCitations,
+                ActionHints = actionHints,
+                RequestId = correlationId,
+                NeedsWebConfirmation = false,
+                WebSearchToken = null,
+                Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
+                Mode = new ModeInfo
                 {
-                    new() { Role = "system", Content = systemPrompt },
-                    new() { Role = "user", Content = userPrompt }
+                    Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                    Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
                 }
             };
 
-            var json = JsonSerializer.Serialize(payload, JsonOpts);
+            return await Ok(req, correlationId, payload);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "ChatFunction failed. correlationId={correlationId}", correlationId);
+            return await InternalError(req, correlationId, "InternalError", "Unexpected error.");
+        }
+    }
 
-            var client = _httpClientFactory.CreateClient("groq");
-            using var httpReq = new HttpRequestMessage(HttpMethod.Post, url);
-            httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            httpReq.Content = new StringContent(json, Encoding.UTF8, "application/json");
+    // ---------------- reflection helpers (no dynamic LINQ) ----------------
 
-            using var httpResp = await client.SendAsync(httpReq, ct);
-            var respText = await httpResp.Content.ReadAsStringAsync(ct);
+    private static string? ExtractString(object? obj, string propertyName)
+    {
+        if (obj is null) return null;
+        try
+        {
+            var prop = obj.GetType().GetProperty(propertyName);
+            return prop?.GetValue(obj)?.ToString();
+        }
+        catch { return null; }
+    }
 
-            if (!httpResp.IsSuccessStatusCode)
+    private static List<Citation> ExtractCitations(object? obj, string propertyName)
+    {
+        var list = new List<Citation>();
+        if (obj is null) return list;
+
+        try
+        {
+            var prop = obj.GetType().GetProperty(propertyName);
+            if (prop is null) return list;
+
+            var raw = prop.GetValue(obj);
+            if (raw is IEnumerable<Citation> typed)
+                return new List<Citation>(typed);
+
+            if (raw is System.Collections.IEnumerable any)
             {
-                _log.LogWarning("Groq error {StatusCode}: {Body}", (int)httpResp.StatusCode, respText);
-                throw new InvalidOperationException($"Groq call failed: {(int)httpResp.StatusCode} {httpResp.ReasonPhrase}");
+                foreach (var item in any)
+                {
+                    if (item is null) continue;
+                    var t = item.GetType();
+
+                    string? title = t.GetProperty("Title")?.GetValue(item)?.ToString();
+                    string? urlOrId =
+                        t.GetProperty("UrlOrId")?.GetValue(item)?.ToString()
+                        ?? t.GetProperty("Url")?.GetValue(item)?.ToString()
+                        ?? t.GetProperty("Id")?.GetValue(item)?.ToString();
+
+                    string? snippet = t.GetProperty("Snippet")?.GetValue(item)?.ToString();
+
+                    list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippet });
+                }
             }
-
-            var parsed = JsonSerializer.Deserialize<GroqChatCompletionsResponse>(respText, JsonOpts);
-            return parsed?.Choices is { Count: > 0 }
-                ? parsed.Choices[0].Message?.Content
-                : string.Empty;
         }
-
-        private static async Task<string> ReadBodyAsync(HttpRequestData req, CancellationToken ct)
+        catch
         {
-            using var reader = new StreamReader(req.Body);
-            return await reader.ReadToEndAsync(ct);
+            // ignore
         }
 
-        private static async Task<HttpResponseData> WriteJsonAsync<T>(
-            HttpRequestData req,
-            HttpStatusCode status,
-            T payload,
-            CancellationToken ct)
+        return list;
+    }
+
+    // ---------------- HTTP helpers ----------------
+
+    private static async Task<HttpResponseData> Ok(HttpRequestData req, string requestId, object payload)
+    {
+        var resp = req.CreateResponse(HttpStatusCode.OK);
+        resp.Headers.Add("Content-Type", "application/json");
+        resp.Headers.Add("x-correlation-id", requestId);
+        await resp.WriteStringAsync(JsonSerializer.Serialize(payload, JsonOut));
+        return resp;
+    }
+
+    private static async Task<HttpResponseData> BadRequest(
+        HttpRequestData req,
+        string requestId,
+        string code,
+        string message,
+        object? details = null)
+    {
+        var resp = req.CreateResponse(HttpStatusCode.BadRequest);
+        resp.Headers.Add("Content-Type", "application/json");
+        resp.Headers.Add("x-correlation-id", requestId);
+
+        var payload = new ErrorResponse
         {
-            var resp = req.CreateResponse(status);
-            resp.Headers.Add("Content-Type", "application/json; charset=utf-8");
-            var json = JsonSerializer.Serialize(payload, JsonOpts);
-            await resp.WriteStringAsync(json, ct);
-            return resp;
-        }
+            RequestId = requestId,
+            Error = new ErrorInfo { Code = code, Message = message, Details = details }
+        };
 
-        // ======== Request/Response Contracts ========
+        await resp.WriteStringAsync(JsonSerializer.Serialize(payload, JsonOut));
+        return resp;
+    }
 
-        public sealed class ChatRequest
+    private static async Task<HttpResponseData> InternalError(
+        HttpRequestData req,
+        string requestId,
+        string code,
+        string message)
+    {
+        var resp = req.CreateResponse(HttpStatusCode.InternalServerError);
+        resp.Headers.Add("Content-Type", "application/json");
+        resp.Headers.Add("x-correlation-id", requestId);
+
+        var payload = new ErrorResponse
         {
-            [JsonPropertyName("message")]
-            public string? Message { get; set; }
+            RequestId = requestId,
+            Error = new ErrorInfo { Code = code, Message = message }
+        };
 
-            // Optional knobs
-            [JsonPropertyName("systemPrompt")]
-            public string? SystemPrompt { get; set; }
+        await resp.WriteStringAsync(JsonSerializer.Serialize(payload, JsonOut));
+        return resp;
+    }
 
-            [JsonPropertyName("temperature")]
-            public double? Temperature { get; set; }
+    // ---------------- misc helpers ----------------
 
-            [JsonPropertyName("maxTokens")]
-            public int? MaxTokens { get; set; }
-        }
-
-        public sealed class ChatResponse
+    private static string GetOrCreateCorrelationId(HttpRequestData req)
+    {
+        if (req.Headers.TryGetValues("x-correlation-id", out var vals))
         {
-            [JsonPropertyName("answer")]
-            public string Answer { get; set; } = string.Empty;
-
-            [JsonPropertyName("sources")]
-            public List<SourceItem> Sources { get; set; } = new();
+            var v = vals?.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(v)) return v!;
         }
+        return Guid.NewGuid().ToString("N");
+    }
 
-        public sealed class SourceItem
+    private static int ReadTopK(string envName, int defaultValue, int min = 1, int max = 10)
+    {
+        var raw = Environment.GetEnvironmentVariable(envName);
+        if (int.TryParse(raw, out var v))
         {
-            [JsonPropertyName("title")]
-            public string? Title { get; set; }
-
-            [JsonPropertyName("url")]
-            public string? Url { get; set; }
-
-            [JsonPropertyName("snippet")]
-            public string? Snippet { get; set; }
+            if (v < min) return min;
+            if (v > max) return max;
+            return v;
         }
+        return defaultValue;
+    }
 
-        public sealed class ErrorResponse
+    private static double GetDoubleEnv(string name, double defaultValue)
+    {
+        var v = (Environment.GetEnvironmentVariable(name) ?? "").Trim();
+        return double.TryParse(v, out var n) ? n : defaultValue;
+    }
+
+    private static double ParseScoreFromSnippet(string? snippet)
+    {
+        if (string.IsNullOrWhiteSpace(snippet)) return 0;
+        var m = Regex.Match(snippet, @"score\s*=\s*(?<s>[0-9]*\.?[0-9]+)", RegexOptions.IgnoreCase);
+        if (!m.Success) return 0;
+        return double.TryParse(m.Groups["s"].Value, out var v) ? v : 0;
+    }
+
+    private static double GetBestScore(IEnumerable<Citation> citations)
+    {
+        double best = 0;
+        foreach (var c in citations)
         {
-            [JsonPropertyName("error")]
-            public string Error { get; set; } = "Error";
-
-            [JsonPropertyName("detail")]
-            public string? Detail { get; set; }
+            var s = ParseScoreFromSnippet(c.Snippet);
+            if (s > best) best = s;
         }
+        return best;
+    }
 
-        // ======== Groq OpenAI-Compatible DTOs ========
+    private static bool IsLowOverlap(string question, string internalText, int minOverlap = 2)
+    {
+        if (string.IsNullOrWhiteSpace(question)) return true;
+        if (string.IsNullOrWhiteSpace(internalText)) return true;
 
-        private sealed class GroqChatCompletionsRequest
+        var q = question.ToLowerInvariant();
+        var t = internalText.ToLowerInvariant();
+
+        var tokens = Regex.Matches(q, @"[a-z0-9\-]{4,}", RegexOptions.IgnoreCase)
+            .Select(m => m.Value)
+            .Distinct()
+            .Take(25)
+            .ToList();
+
+        int hit = 0;
+        foreach (var tok in tokens)
         {
-            [JsonPropertyName("model")]
-            public string Model { get; set; } = "llama-3.3-70b-versatile";
-
-            [JsonPropertyName("messages")]
-            public List<GroqMessage> Messages { get; set; } = new();
-
-            [JsonPropertyName("temperature")]
-            public double Temperature { get; set; } = 0.2;
-
-            [JsonPropertyName("max_tokens")]
-            public int MaxTokens { get; set; } = 600;
+            if (t.Contains(tok))
+            {
+                hit++;
+                if (hit >= minOverlap) return false;
+            }
         }
+        return true;
+    }
 
-        private sealed class GroqMessage
+    private static bool IsTavilyConfigured()
+    {
+        var apiKey = Environment.GetEnvironmentVariable("TAVILY_API_KEY")?.Trim();
+        return !string.IsNullOrWhiteSpace(apiKey) && !apiKey.Contains("<");
+    }
+
+    // --- token helpers (same logic) ---
+    private static string MakeWebConfirmToken(string message, string correlationId)
+    {
+        var secret = (Environment.GetEnvironmentVariable("WEBSEARCH_CONFIRM_SECRET") ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(secret))
+            secret = "fallback-" + correlationId;
+
+        var exp = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
+        var mh = Sha256Hex(message);
+
+        var payloadJson = JsonSerializer.Serialize(new { exp, mh });
+        var sig = HmacSha256(secret, payloadJson);
+
+        return Base64UrlEncode(Encoding.UTF8.GetBytes(payloadJson)) + "." + Base64UrlEncode(sig);
+    }
+
+    private static bool ValidateWebConfirmToken(string token, string message)
+    {
+        var secret = (Environment.GetEnvironmentVariable("WEBSEARCH_CONFIRM_SECRET") ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(secret)) return false;
+
+        var parts = token.Split('.', 2);
+        if (parts.Length != 2) return false;
+
+        byte[] payloadBytes;
+        byte[] sigBytes;
+        try
         {
-            [JsonPropertyName("role")]
-            public string Role { get; set; } = "user";
-
-            [JsonPropertyName("content")]
-            public string Content { get; set; } = string.Empty;
+            payloadBytes = Base64UrlDecode(parts[0]);
+            sigBytes = Base64UrlDecode(parts[1]);
         }
+        catch { return false; }
 
-        private sealed class GroqChatCompletionsResponse
+        var payloadJson = Encoding.UTF8.GetString(payloadBytes);
+
+        var expectedSig = HmacSha256(secret, payloadJson);
+        if (!CryptographicOperations.FixedTimeEquals(sigBytes, expectedSig))
+            return false;
+
+        try
         {
-            [JsonPropertyName("choices")]
-            public List<GroqChoice> Choices { get; set; } = new();
-        }
+            using var doc = JsonDocument.Parse(payloadJson);
+            var root = doc.RootElement;
 
-        private sealed class GroqChoice
-        {
-            [JsonPropertyName("message")]
-            public GroqChoiceMessage? Message { get; set; }
-        }
+            var exp = root.GetProperty("exp").GetInt64();
+            var mh = root.GetProperty("mh").GetString() ?? "";
 
-        private sealed class GroqChoiceMessage
-        {
-            [JsonPropertyName("content")]
-            public string? Content { get; set; }
+            if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() > exp) return false;
+            return string.Equals(mh, Sha256Hex(message), StringComparison.OrdinalIgnoreCase);
         }
+        catch { return false; }
+    }
+
+    private static byte[] HmacSha256(string secret, string payload)
+    {
+        using var h = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        return h.ComputeHash(Encoding.UTF8.GetBytes(payload));
+    }
+
+    private static string Sha256Hex(string s)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes) sb.Append(b.ToString("x2"));
+        return sb.ToString();
+    }
+
+    private static string Base64UrlEncode(byte[] data) =>
+        Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    private static byte[] Base64UrlDecode(string s)
+    {
+        s = s.Replace('-', '+').Replace('_', '/');
+        if (s.Length % 4 == 2) s += "==";
+        else if (s.Length % 4 == 3) s += "=";
+        return Convert.FromBase64String(s);
     }
 }
