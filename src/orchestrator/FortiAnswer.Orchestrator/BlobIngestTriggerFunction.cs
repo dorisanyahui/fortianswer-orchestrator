@@ -17,13 +17,12 @@ public sealed class BlobIngestTriggerFunction
 
     [Function("blob_ingest_trigger")]
     public async Task Run(
-        [BlobTrigger("%INGEST_CONTAINER%/{name}", Connection = "AzureWebJobsStorage")] byte[] content,
+        [BlobTrigger("%BLOB_CONTAINER%/{name}", Connection = "BLOB_CONNECTION")] byte[] content,
         string name,
         CancellationToken ct)
     {
         _logger.LogInformation("Blob trigger fired: {name}, bytes={len}", name, content.Length);
 
-        // 1) 只处理你支持的文件类型（先把范围收窄，方便排错）
         if (!name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase) &&
             !name.EndsWith(".docx", StringComparison.OrdinalIgnoreCase) &&
             !name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
@@ -32,9 +31,9 @@ public sealed class BlobIngestTriggerFunction
             return;
         }
 
-        // 2) 调用“单文件 ingest”
         var (files, chunks) = await _ingestor.RunSingleAsync(name, content, ct);
 
         _logger.LogInformation("Ingest done: files={files}, chunks={chunks}, name={name}", files, chunks, name);
     }
+
 }
