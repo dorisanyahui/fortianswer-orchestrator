@@ -1,0 +1,184 @@
+@baseUrl = http://localhost:7071
+@chatUrl = {{baseUrl}}/api/chat
+@ingestUrl = {{baseUrl}}/api/ingest
+
+############################################################
+# Sprint 1 Demo - End-to-End Test Script
+# - Role -> boundary (RBAC): Customer vs Agent vs Admin
+# - Data boundary -> Azure AI Search filter (classification)
+# - Web search only allowed when boundary == Public
+# - Restricted/Confidential policy gates
+# - NEW: if request dataBoundary == Restricted, server forces Restricted and ALWAYS escalates (no downgrade)
+############################################################
+
+
+### 0) Health check
+GET {{baseUrl}}/api/health
+
+
+############################################################
+# A) Ingest (optional)
+# If you've already ingested, you can skip.
+# Note: ingest endpoint is AuthorizationLevel.Function.
+# If you test locally without key enforcement, it may still work.
+############################################################
+
+### A1) Ingest public/ (default)
+POST {{ingestUrl}}
+
+### A2) Ingest internal/
+POST {{ingestUrl}}
+Content-Type: application/json
+
+{ "prefix": "internal/", "maxFiles": 50 }
+
+### A3) Ingest confidential/
+POST {{ingestUrl}}
+Content-Type: application/json
+
+{ "prefix": "confidential/", "maxFiles": 50 }
+
+### A4) Ingest restricted/
+POST {{ingestUrl}}
+Content-Type: application/json
+
+{ "prefix": "restricted/", "maxFiles": 50 }
+
+
+############################################################
+# B) RBAC + Boundary enforcement (core Sprint1)
+############################################################
+
+### B1) Customer/Public: normal end-user question (VPN)
+# Expect: role=Customer, boundary=Public
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
+
+{
+  "message": "My VPN won't connect and keeps timing out. What should I try first?",
+  "issueType": "VPN"
+}
+
+### B2) Customer tries to access Internal (should be downgraded to Public)
+# Expect: boundary=Public in actionHints, and NO internal citations.
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+x-user-role: Customer
+
+{
+  "message": "What is our Tier-1 phishing triage procedure?",
+  "issueType": "Phishing",
+  "dataBoundary": "Internal"
+}
+
+### B3) Agent/Internal: same internal question should be allowed
+# Expect: role=Agent, boundary=Internal, and internal citations appear.
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
+
+{
+  "message": "What is our Tier-1 phishing triage procedure?",
+  "issueType": "Phishing",
+  "dataBoundary": "Internal"
+}
+
+### B4) Admin/Confidential: confidential topic allowed
+# Expect: role=Admin, boundary=Confidential, can return confidential citations.
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Admin
+
+{
+  "message": "We confirmed malicious activity. What is the containment coordination approach and who leads it?",
+  "issueType": "General",
+  "dataBoundary": "Confidential"
+}
+
+### B5) Agent requests Confidential (MUST escalate; no downgrade)
+# Expect: escalation.ShouldEscalate=true, policy:confidential_request_requires_admin
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
+
+{
+  "message": "We confirmed malicious activity. What is the containment coordination approach and who leads it?",
+  "issueType": "General",
+  "dataBoundary": "Confidential"
+}
+
+### B6) Restricted: ALWAYS escalate (forced boundary, no downgrade)
+# NEW RULE: if client explicitly requests dataBoundary=Restricted, server forces boundary=Restricted.
+# Expect: escalation.ShouldEscalate=true, policy:restricted_escalate for ANY role (Customer/Agent/Admin).
+#
+# B6a) Customer asks Restricted -> still escalates (no fallback to Public)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted"
+}
+
+# B6b) Admin asks Restricted -> still escalates
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Admin
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted"
+}
+
+
+############################################################
+# C) Web Search gating (Public only)
+# - Public: if internal evidence insufficient, it asks for confirmation + token
+# - Internal: web-search blocked even if confirmWebSearch=true
+############################################################
+
+### C1) Public: likely needs web evidence -> should ask for web search confirmation
+# Expect: needsWebConfirmation=true + webSearchToken returned (if WEBSEARCH_MODE=tavily and key configured)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
+
+{
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Public",
+  "confirmWebSearch": false
+}
+
+### C2) Public: confirm web search (paste token from C1)
+# Expect: actionHints includes used:web_search
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
+
+{
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Public",
+  "confirmWebSearch": true,
+  "webSearchToken": "eyJleHAiOjE3NzE3OTMxMTEsIm1oIjoiODYyZWYzZjY3Mzk4NTk1NzZjODVjMDczMTAxODFjMGYzMjhhZDQzMGI5NDU4NDE3MTM1YzZjNTFhOWMxNDllNyJ9.usdMEKeAy-9IOmahwE9fxhVeZ_6ERZgPq95aUxqEbYI",
+  "requestId": "86ae990d13e44a33ae9743637e05f58e",
+  "requestId": "a33384c5a8f44164a08a2e24a60666fc"
+}
+
+### C3) Internal: same request but Agent should be blocked from web search
+# Expect: web_blocked:boundary_not_public (even with confirmWebSearch=true)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
+
+{
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Internal",
+  "confirmWebSearch": true
+}

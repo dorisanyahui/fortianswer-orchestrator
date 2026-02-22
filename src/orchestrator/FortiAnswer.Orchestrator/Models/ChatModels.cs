@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace FortiAnswer.Orchestrator.Models;
 
 /// <summary>
@@ -5,34 +7,60 @@ namespace FortiAnswer.Orchestrator.Models;
 /// </summary>
 public sealed class ChatRequest
 {
+    /// <summary>
+    /// User natural-language question.
+    /// </summary>
     public string? Message { get; set; }
 
     /// <summary>
-    /// e.g. "Public" | "Internal"
+    /// Sprint1 UI scenario selection (user-facing).
+    /// Examples: "Phishing" | "VPN" | "MFA" | "SuspiciousLogin" | "EndpointAlert" | "PasswordReset" | "General"
+    /// </summary>
+    public string? IssueType { get; set; }
+
+    /// <summary>
+    /// Data boundary (security classification / access level).
+    /// Server should decide this from user identity/role, not trust the client.
+    /// Examples: "Public" | "Internal" | "Confidential" | "Restricted"
+    /// </summary>
+    public string? DataBoundary { get; set; }
+
+    /// <summary>
+    /// Legacy field kept for backward compatibility with older UI clients.
+    /// DEPRECATED: treat as DataBoundary if DataBoundary is null.
     /// </summary>
     public string? RequestType { get; set; }
 
     /// <summary>
-    /// e.g. "User" | "Agent" | "Admin"
+    /// User role hint. Keep for demos; do NOT rely on this for real RBAC.
+    /// Preferred: derive from auth claims or trusted headers.
     /// </summary>
     public string? UserRole { get; set; }
 
     /// <summary>
-    /// Optional group name / role group for data boundary filtering
+    /// User group hint. Keep for demos; do NOT rely on this for real RBAC.
     /// </summary>
     public string? UserGroup { get; set; }
 
     /// <summary>
-    /// Optional client-side conversation/thread id
+    /// Optional conversation/session id for UI threading.
     /// </summary>
     public string? ConversationId { get; set; }
 
+    /// <summary>
+    /// When true, user confirms allowing external web search (Public only).
+    /// </summary>
     public bool? ConfirmWebSearch { get; set; }
+
+    /// <summary>
+    /// Signed token issued by server when it asks user to confirm web search.
+    /// Required when ConfirmWebSearch=true.
+    /// </summary>
     public string? WebSearchToken { get; set; }
 }
 
 /// <summary>
-/// Evidence snippet returned from Retrieval
+/// Evidence snippet returned from Retrieval or Web Search.
 /// </summary>
 public sealed class Citation
 {
@@ -56,7 +84,7 @@ public sealed class EscalationInfo
 public sealed class ModeInfo
 {
     public string Retrieval { get; set; } = "stub"; // stub | azureaisearch | ...
-    public string Llm { get; set; } = "stub";       // stub | azureopenai | ...
+    public string Llm { get; set; } = "stub";       // stub | groq | azureopenai | ...
 }
 
 /// <summary>
@@ -65,11 +93,23 @@ public sealed class ModeInfo
 public sealed class ChatResponse
 {
     public string Answer { get; set; } = "";
-    public List<Citation> Citations { get; set; } = new();
-    public List<string> ActionHints { get; set; } = new();
-    public bool NeedsWebConfirmation { get; set; }
-    public string? WebSearchToken { get; set; }
 
+    public List<Citation> Citations { get; set; } = new();
+
+    /// <summary>
+    /// Debug breadcrumbs for demo/diagnostics (e.g., used:internal_search, used:web_search, boundary=Public).
+    /// </summary>
+    public List<string> ActionHints { get; set; } = new();
+
+    /// <summary>
+    /// True when the server requires user confirmation before running web search.
+    /// </summary>
+    public bool NeedsWebConfirmation { get; set; }
+
+    /// <summary>
+    /// Server-issued confirmation token. Client must resend it with ConfirmWebSearch=true.
+    /// </summary>
+    public string? WebSearchToken { get; set; }
 
     /// <summary>
     /// Trace id = correlationId (also returned in response header x-correlation-id)
@@ -85,7 +125,7 @@ public sealed class ChatResponse
 }
 
 /// <summary>
-/// Standardized error object (Task10)
+/// Standardized error object
 /// </summary>
 public sealed class ErrorInfo
 {
@@ -103,7 +143,7 @@ public sealed class ErrorInfo
 }
 
 /// <summary>
-/// Error response for POST /api/chat (Task10)
+/// Error response for POST /api/chat
 /// </summary>
 public sealed class ErrorResponse
 {

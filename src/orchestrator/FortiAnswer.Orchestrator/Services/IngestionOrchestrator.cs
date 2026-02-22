@@ -28,7 +28,7 @@ public sealed class IngestionOrchestrator
         _docx = docx;
     }
 
-    // Batch mode (unchanged behavior)
+    // Batch mode
     public async Task<(int files, int chunks)> RunAsync(string? prefix, int maxFiles, CancellationToken ct)
     {
         int files = 0;
@@ -90,6 +90,11 @@ public sealed class IngestionOrchestrator
         int chunkid = 0;
         int chunksTotal = 0;
 
+        // ✅ NEW: infer classification from path prefix (public/internal/confidential/restricted)
+        // Example path: "public/FAQ-PUBLIC-VPN-TROUBLESHOOTING-20260217.docx"
+        var classification = InferClassification(path);
+        var docType = InferDocTypeFromName(path); // optional, useful later
+
         var chunks = _chunker.ChunkByChars(content, 1200, 150).ToList();
         const int batchSize = 16;
 
@@ -117,6 +122,11 @@ public sealed class IngestionOrchestrator
                     ["content"] = batch[j],
                     ["source"] = sourceId,
                     ["path"] = path,
+
+                    // ✅ NEW: security classification for RBAC filtering
+                    ["classification"] = classification,    // "public" | "internal" | "confidential" | "restricted" | "unknown"
+            
+
                     ["chunkid"] = chunkid,
                     ["page"] = 1,
                     ["createdUtc"] = now,
@@ -137,5 +147,43 @@ public sealed class IngestionOrchestrator
         var base64 = Convert.ToBase64String(hash)
             .Replace('+', '-').Replace('/', '_').TrimEnd('=');
         return $"b_{base64}";
+    }
+
+    /// <summary>
+    /// Infer classification from blob path prefix.
+    /// Expected: public/..., internal/..., confidential/..., restricted/...
+    /// If not matched, returns "unknown" (safer than defaulting to public).
+    /// </summary>
+    private static string InferClassification(string path)
+    {
+        var p = (path ?? "").Trim().Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(p)) return "unknown";
+
+        // first segment before '/'
+        var idx = p.IndexOf('/');
+        var first = (idx >= 0 ? p[..idx] : p).Trim().ToLowerInvariant();
+
+        return first switch
+        {
+            "public" => "public",
+            "internal" => "internal",
+            "confidential" => "confidential",
+            "restricted" => "restricted",
+            _ => "unknown"
+        };
+    }
+
+    /// <summary>
+    /// Optional: infer docType from filename.
+    /// </summary>
+    private static string InferDocTypeFromName(string path)
+    {
+        var p = (path ?? "").Replace('\\', '/');
+        var name = p.Split('/').LastOrDefault() ?? p;
+        name = name.ToLowerInvariant();
+
+        if (name.StartsWith("faq-")) return "faq";
+        if (name.StartsWith("policy-")) return "policy";
+        return "doc";
     }
 }

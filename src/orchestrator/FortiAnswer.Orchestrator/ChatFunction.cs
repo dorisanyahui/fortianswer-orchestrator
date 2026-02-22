@@ -45,12 +45,10 @@ public sealed class ChatFunction
         _groq = groq;
     }
 
-    // ✅ authLevel changed to Anonymous
     [Function("chat")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat")] HttpRequestData req)
     {
-        // (3) Server-generated request id; keep client correlation id separately
         var clientCorrelationId = GetClientCorrelationId(req);
         var requestId = Guid.NewGuid().ToString("N");
 
@@ -76,40 +74,130 @@ public sealed class ChatFunction
             if (string.IsNullOrWhiteSpace(message))
                 return await BadRequest(req, requestId, clientCorrelationId, "ValidationError", "Field 'message' is required.", new { field = "message" });
 
-            var requestType = (body?.RequestType ?? Environment.GetEnvironmentVariable("DATA_BOUNDARY_DEFAULT") ?? "Public").Trim();
-            var userRole = (body?.UserRole ?? "User").Trim();
+            // 3) Resolve role + boundary (server-side)
+            // Header-driven role for Sprint1 demo: x-user-role: Customer|Agent|Admin
+            var headerRole = GetHeader(req, "x-user-role");
+            var userRole = NormalizeRole(headerRole ?? body?.UserRole ?? "Customer");
+
+            // IssueType (UI scenario)
+            var issueType = NormalizeIssueType(body?.IssueType);
+
+            // ✅ Prefer DataBoundary, then legacy RequestType, then env default
+            var requestedBoundary = NormalizeBoundary(
+                body?.DataBoundary
+                ?? body?.RequestType
+                ?? Environment.GetEnvironmentVariable("DATA_BOUNDARY_DEFAULT")
+                ?? Environment.GetEnvironmentVariable("SEARCH_DEFAULT_BOUNDARY")
+                ?? "Public"
+            );
+
+            // Compute the max boundary the caller is allowed to use (may be downgraded by role).
+            var allowedBoundary = DecideBoundary(userRole, requestedBoundary);
+
+            // ✅ POLICY (Scheme B)
+            // - If client explicitly requests Restricted => ALWAYS Escalate (no downgrade).
+            // - If client explicitly requests Confidential but caller isn't Admin => Escalate (no downgrade).
+            // Otherwise, proceed with allowedBoundary.
+            var boundary = string.Equals(requestedBoundary, "Restricted", StringComparison.OrdinalIgnoreCase)
+                ? "Restricted"
+                : allowedBoundary;
+
             var userGroup = body?.UserGroup;
             var conversationId = body?.ConversationId;
 
-            // TopK config
-            var internalTopK = ReadTopK("INTERNAL_TOPK", 2, 1, 10);
+            // TopK config for web only (RetrievalService has its own topK env)
             var webTopK = ReadTopK("WEB_TOPK", 3, 1, 10);
 
             var actionHints = new List<string>
             {
-                $"cfg:internalTopK={internalTopK}",
                 $"cfg:webTopK={webTopK}",
-                $"serverRequestId={requestId}"
+                $"serverRequestId={requestId}",
+                $"role={userRole}",
+                $"boundary={boundary}",
+                $"issueType={issueType}"
             };
 
             if (!string.IsNullOrWhiteSpace(clientCorrelationId))
                 actionHints.Add($"clientCorrelationId={clientCorrelationId}");
 
-            // 3) Internal retrieval (object, not dynamic)
-            object internalBundle = await _retrieval.RetrieveAsync(
-                question: message!,
-                requestType: requestType,
+            // 4) Policy gates
+            if (string.Equals(boundary, "Restricted", StringComparison.OrdinalIgnoreCase))
+            {
+                actionHints.Add("policy:restricted_escalate");
+
+                var payloadRestricted = new ChatResponse
+                {
+                    Answer =
+                        "This request falls under Restricted content. I can’t provide step-by-step playbook details in chat.\n" +
+                        "I’ll escalate this to an authorized responder. Please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.",
+                    Citations = new List<Citation>(),
+                    ActionHints = actionHints,
+                    RequestId = requestId,
+                    NeedsWebConfirmation = false,
+                    WebSearchToken = null,
+                    Escalation = new EscalationInfo { ShouldEscalate = true, Reason = "Restricted content requires escalation." },
+                    Mode = new ModeInfo
+                    {
+                        Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                        Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                    }
+                };
+
+                return await Ok(req, requestId, clientCorrelationId, payloadRestricted);
+            }
+
+            if (string.Equals(requestedBoundary, "Confidential", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase))
+            {
+                actionHints.Add("policy:confidential_request_requires_admin");
+                actionHints.Add($"requestedBoundary={requestedBoundary}");
+                actionHints.Add($"allowedBoundary={allowedBoundary}");
+
+            var payloadConf = new ChatResponse
+            {
+                Answer = """
+            This request explicitly requires Confidential handling, but you are not authorized (Admin) to access Confidential content.
+
+            I'll escalate this request to an authorized responder.
+            """,
+                Citations = new List<Citation>(),
+                ActionHints = actionHints,
+                RequestId = requestId,
+                NeedsWebConfirmation = false,
+                WebSearchToken = null,
+                Escalation = new EscalationInfo { ShouldEscalate = true, Reason = "Confidential request requires Admin access." },
+                Mode = new ModeInfo
+                {
+                    Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                    Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                }
+            };
+
+                return await Ok(req, requestId, clientCorrelationId, payloadConf);
+            }
+
+            // 5) Internal retrieval (matches your RetrievalService signature)
+            var internalBundle = await _retrieval.RetrieveAsync(
+                query: message!,
+                requestType: boundary,
+                userRole: userRole,
                 userGroup: userGroup,
-                topK: internalTopK,
-                correlationId: requestId
+                ct: default
             );
 
+            // ✅ Debug (now works because ExtractString supports Dictionary)
+            actionHints.Add("retrieval:boundary=" + (ExtractString(internalBundle, "Boundary") ?? ""));
+            actionHints.Add("retrieval:filter=" + (ExtractString(internalBundle, "Filter") ?? ""));
+            actionHints.Add("retrieval:debug=" + (ExtractString(internalBundle, "Debug") ?? ""));
+
             var internalContext = ExtractString(internalBundle, "Context") ?? "";
+
+            // ✅ Critical fix: ExtractCitations supports Dictionary/List-of-dict returned by RetrievalService
             var internalCitationsRaw = ExtractCitations(internalBundle, "Citations");
 
             actionHints.Add(internalCitationsRaw.Count > 0 ? "used:internal_search" : "used:internal_search_empty");
 
-            // 4) Decide if internal evidence is insufficient/off-topic
+            // 6) Decide if internal evidence is insufficient/off-topic
             double minScore = GetDoubleEnv("SEARCH_MIN_SCORE", 0.01);
             double bestScore = GetBestScore(internalCitationsRaw);
 
@@ -127,7 +215,7 @@ public sealed class ChatFunction
 
             bool needWeb = noEvidence || weakEvidence || lowOverlap;
 
-            // (1) Filter off-topic internal citations
+            // Filter off-topic internal citations
             var internalCitationsFiltered = (lowOverlap || weakEvidence)
                 ? new List<Citation>()
                 : internalCitationsRaw;
@@ -135,8 +223,8 @@ public sealed class ChatFunction
             if (lowOverlap || weakEvidence)
                 actionHints.Add("internal:citations_filtered=true");
 
-            // 5) Web enablement
-            bool isPublic = string.Equals(requestType, "Public", StringComparison.OrdinalIgnoreCase);
+            // 7) Web enablement (ONLY Public)
+            bool isPublic = string.Equals(boundary, "Public", StringComparison.OrdinalIgnoreCase);
             var webMode = (Environment.GetEnvironmentVariable("WEBSEARCH_MODE") ?? "off").Trim().ToLowerInvariant();
             bool webEnabled = isPublic && webMode == "tavily" && IsTavilyConfigured();
 
@@ -203,13 +291,14 @@ public sealed class ChatFunction
             }
             else
             {
-                actionHints.Add(needWeb ? "web_disabled_or_not_allowed" : "next:optional_web_search");
+                if (needWeb && !isPublic) actionHints.Add("web_blocked:boundary_not_public");
+                else actionHints.Add(needWeb ? "web_disabled_or_not_allowed" : "next:optional_web_search");
             }
 
-            // 6) Build prompt (plus guardrails)
+            // 8) Build prompt
             var basePrompt = _promptBuilder.Build(
                 userMessage: message!,
-                requestType: requestType,
+                requestType: boundary,
                 userRole: userRole,
                 userGroup: userGroup,
                 conversationId: conversationId,
@@ -217,21 +306,35 @@ public sealed class ChatFunction
                 webContext: webContext
             );
 
-            // (2) Add source-grounding + timeline consistency rules
+            var escalationHint =
+                "\n\n=== ESCALATION STATE ===\n" +
+                "Escalation: None (this chat response is not escalated unless the API returns escalation.shouldEscalate=true)\n" +
+                "=== END ESCALATION STATE ===\n";
+
+            var issueHint =
+                "\n\n=== ISSUE TYPE (CONTEXT) ===\n" +
+                $"IssueType: {issueType}\n" +
+                "Guidance:\n" +
+                "- VPN/MFA/PasswordReset: end-user friendly, step-by-step, safety reminders.\n" +
+                "- Phishing/AccountLockout/Severity/SuspiciousLogin/EndpointAlert: internal workflow, ticket notes, escalation criteria.\n" +
+                "=== END ISSUE TYPE ===\n";
+
             var guardrails =
                 "\n\n=== RESPONSE RULES (IMPORTANT) ===\n" +
                 "1) Use only facts supported by the provided citations (especially dates, versions, affected products, and mitigations).\n" +
                 "2) If a detail is not supported by citations, say \"Not confirmed by sources\" and do not guess.\n" +
-                "3) If you include a timeline, label each entry as one of: discovered / reported / removed / patched, and keep the timeline internally consistent.\n" +
-                "4) Prefer concise, actionable mitigations.\n" +
+                "3) Do NOT paste raw URLs in the answer. If a source is needed, rely on the citations list.\n" +
+                "4) Escalation language control: This chat response is NOT automatically escalated. Do not say or imply \"I escalated\" / \"after escalation\" / \"we have escalated\".\n" +
+                "   You MAY mention escalation only as a conditional next step (e.g., \"If confirmed, escalate to Tier-2\") when explicitly supported by citations.\n" +
+                "5) Prefer concise, actionable mitigations.\n" +
                 "=== END RULES ===\n";
 
-            var prompt = basePrompt + guardrails;
+            var prompt = basePrompt + escalationHint + issueHint + guardrails;
 
-            // 7) Groq generate
+            // 9) Groq generate
             var answer = await _groq.GenerateAsync(prompt, requestId) ?? "";
 
-            // 8) Response
+            // 10) Response
             var payload = new ChatResponse
             {
                 Answer = answer,
@@ -257,17 +360,142 @@ public sealed class ChatFunction
         }
     }
 
-    // ---------------- Reflection helpers (no dynamic LINQ) ----------------
+    // ---------------- Role / Boundary / Issue helpers ----------------
+
+    private static string NormalizeRole(string role)
+    {
+        role = (role ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(role)) return "Customer";
+        role = role.ToLowerInvariant();
+        return role switch
+        {
+            "customer" => "Customer",
+            "user" => "Customer",
+            "enduser" => "Customer",
+            "agent" => "Agent",
+            "soc" => "Agent",
+            "analyst" => "Agent",
+            "admin" => "Admin",
+            "it" => "Admin",
+            _ => char.ToUpperInvariant(role[0]) + role[1..]
+        };
+    }
+
+    private static string NormalizeBoundary(string boundary)
+    {
+        boundary = (boundary ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(boundary)) return "Public";
+        boundary = boundary.ToLowerInvariant();
+        return boundary switch
+        {
+            "public" => "Public",
+            "internal" => "Internal",
+            "confidential" => "Confidential",
+            "restricted" => "Restricted",
+            _ => char.ToUpperInvariant(boundary[0]) + boundary[1..]
+        };
+    }
+
+    private static string NormalizeIssueType(string? t)
+    {
+        t = (t ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(t)) return "General";
+        t = t.ToLowerInvariant();
+
+        return t switch
+        {
+            "vpn" => "VPN",
+            "mfa" => "MFA",
+            "passwordreset" => "PasswordReset",
+            "password_reset" => "PasswordReset",
+            "phishing" => "Phishing",
+            "suspiciouslogin" => "SuspiciousLogin",
+            "endpointalert" => "EndpointAlert",
+            "accountlockout" => "AccountLockout",
+            "lockout" => "AccountLockout",
+            "severity" => "Severity",
+            _ => "General"
+        };
+    }
+
+    private static int BoundaryRank(string boundary) => NormalizeBoundary(boundary) switch
+    {
+        "Public" => 0,
+        "Internal" => 1,
+        "Confidential" => 2,
+        "Restricted" => 3,
+        _ => 0
+    };
+
+    // Minimal Sprint1 policy:
+    // Customer => Public only
+    // Agent => up to Internal
+    // Admin => up to Confidential
+    // Restricted always escalates (handled earlier)
+    private static string DecideBoundary(string userRole, string requestedBoundary)
+    {
+        int req = BoundaryRank(requestedBoundary);
+        int max = userRole switch
+        {
+            "Admin" => BoundaryRank("Confidential"),
+            "Agent" => BoundaryRank("Internal"),
+            _ => BoundaryRank("Public"),
+        };
+
+        int use = Math.Min(req, max);
+
+        return use switch
+        {
+            0 => "Public",
+            1 => "Internal",
+            2 => "Confidential",
+            3 => "Restricted",
+            _ => "Public"
+        };
+    }
+
+    private static string? GetHeader(HttpRequestData req, string name)
+    {
+        if (req.Headers.TryGetValues(name, out var vals))
+        {
+            var v = vals?.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(v)) return v;
+        }
+        return null;
+    }
+
+    // ---------------- Reflection / dictionary helpers ----------------
 
     private static string? ExtractString(object? obj, string propertyName)
     {
         if (obj is null) return null;
+
         try
         {
-            var prop = obj.GetType().GetProperty(propertyName);
-            return prop?.GetValue(obj)?.ToString();
+            // Dictionary<string, object>
+            if (obj is IDictionary<string, object> dict)
+            {
+                if (dict.TryGetValue(propertyName, out var v) && v is not null)
+                    return v.ToString();
+                return null;
+            }
+
+            // JsonElement object
+            if (obj is JsonElement je)
+            {
+                if (je.ValueKind == JsonValueKind.Object && je.TryGetProperty(propertyName, out var prop))
+                    return prop.ToString();
+                return null;
+            }
+
+            // reflection property
+            var propInfo = obj.GetType().GetProperty(propertyName);
+            return propInfo?.GetValue(obj)?.ToString();
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
     }
 
     private static List<Citation> ExtractCitations(object? obj, string propertyName)
@@ -277,35 +505,99 @@ public sealed class ChatFunction
 
         try
         {
-            var prop = obj.GetType().GetProperty(propertyName);
-            if (prop is null) return list;
+            object? raw = null;
 
-            var raw = prop.GetValue(obj);
+            // Dictionary bundle
+            if (obj is IDictionary<string, object> dict)
+            {
+                dict.TryGetValue(propertyName, out raw);
+            }
+            else
+            {
+                // reflection property
+                var prop = obj.GetType().GetProperty(propertyName);
+                raw = prop?.GetValue(obj);
+            }
+
+            if (raw is null) return list;
+
+            // Already typed
             if (raw is IEnumerable<Citation> typed)
                 return new List<Citation>(typed);
 
+            // JSON array
+            if (raw is JsonElement je && je.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in je.EnumerateArray())
+                {
+                    var title = item.TryGetProperty("title", out var t) ? t.GetString() : null;
+                    var urlOrId = item.TryGetProperty("urlOrId", out var u) ? u.GetString()
+                               : item.TryGetProperty("url", out var u2) ? u2.GetString()
+                               : item.TryGetProperty("id", out var i2) ? i2.GetString() : null;
+                    var snippet = item.TryGetProperty("snippet", out var s) ? s.GetString() : null;
+
+                    list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippet });
+                }
+                return list;
+            }
+
+            // IEnumerable of dictionaries / anonymous objects
             if (raw is System.Collections.IEnumerable any)
             {
                 foreach (var item in any)
                 {
                     if (item is null) continue;
+
+                    // Most important: RetrievalService returns Dictionary<string, object>
+                    if (item is IDictionary<string, object> d)
+                    {
+                        // Prefer path as title, source as urlOrId if you want
+                        var path = d.TryGetValue("path", out var pv) ? pv?.ToString() : null;
+                        var source = d.TryGetValue("source", out var sv) ? sv?.ToString() : null;
+                        var id = d.TryGetValue("id", out var iv) ? iv?.ToString() : null;
+
+                        // Score may be double or string
+                        var scoreStr = "";
+                        if (d.TryGetValue("score", out var sc) && sc is not null)
+                            scoreStr = sc.ToString() ?? "";
+
+                        var snippet = string.IsNullOrWhiteSpace(scoreStr) ? null : $"score={scoreStr}";
+
+                        list.Add(new Citation
+                        {
+                            Title = path ?? source ?? id,
+                            UrlOrId = path ?? source ?? id,
+                            Snippet = snippet
+                        });
+
+                        continue;
+                    }
+
+                    // Fallback reflection
                     var t = item.GetType();
 
-                    string? title = t.GetProperty("Title")?.GetValue(item)?.ToString();
+                    string? title = t.GetProperty("Title")?.GetValue(item)?.ToString()
+                                 ?? t.GetProperty("title")?.GetValue(item)?.ToString()
+                                 ?? t.GetProperty("path")?.GetValue(item)?.ToString();
+
                     string? urlOrId =
                         t.GetProperty("UrlOrId")?.GetValue(item)?.ToString()
+                        ?? t.GetProperty("urlOrId")?.GetValue(item)?.ToString()
                         ?? t.GetProperty("Url")?.GetValue(item)?.ToString()
-                        ?? t.GetProperty("Id")?.GetValue(item)?.ToString();
+                        ?? t.GetProperty("url")?.GetValue(item)?.ToString()
+                        ?? t.GetProperty("Id")?.GetValue(item)?.ToString()
+                        ?? t.GetProperty("id")?.GetValue(item)?.ToString();
 
-                    string? snippet = t.GetProperty("Snippet")?.GetValue(item)?.ToString();
+                        string? snippetText = t.GetProperty("Snippet")?.GetValue(item)?.ToString()
+                                        ?? t.GetProperty("snippet")?.GetValue(item)?.ToString();
 
-                    list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippet });
+                        list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippetText });
                 }
             }
         }
         catch
         {
-            // ignore and return empty
+            // ignore
         }
 
         return list;
@@ -402,7 +694,7 @@ public sealed class ChatFunction
         return double.TryParse(v, out var n) ? n : defaultValue;
     }
 
-    // ---------------- Evidence quality heuristics ----------------
+    // ---------------- Evidence heuristics ----------------
 
     private static double ParseScoreFromSnippet(string? snippet)
     {
@@ -459,6 +751,7 @@ public sealed class ChatFunction
     // Env: WEBSEARCH_CONFIRM_SECRET
     // Token: base64url(payloadJson) + "." + base64url(hmacSha256(payloadJson))
     // payloadJson: {"exp":<unixSeconds>,"mh":"<sha256(message)>"}
+
     private static string MakeWebConfirmToken(string message, string requestId)
     {
         var secret = (Environment.GetEnvironmentVariable("WEBSEARCH_CONFIRM_SECRET") ?? "").Trim();

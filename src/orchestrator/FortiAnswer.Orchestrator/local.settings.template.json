@@ -1,24 +1,64 @@
 {
   "IsEncrypted": false,
   "Values": {
-    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "INTERNAL_TOPK": "2",
+    "WEB_TOPK": "3",
+
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=https;AccountName=rgcapstoneac35;AccountKey==;EndpointSuffix=core.windows.net",
     "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+
+    "INGEST_CONTAINER": "fortianswer-docs",
+
 
     "ORCH_ENV": "local",
     "ORCH_LOG_LEVEL": "Information",
 
-    "RETRIEVAL_MODE": "stub",
-    "RETRIEVAL_ENDPOINT": "",
-    "RETRIEVAL_API_KEY": "",
-    "RETRIEVAL_INDEX": "",
+    "OPENAI_API_KEY": "xxxx",
+    "OPENAI_EMBED_MODEL": "text-embedding-3-small",
+
+    "RETRIEVAL_MODE": "azureaisearch",
+    "SEARCH_ENDPOINT": "https://fortianswer-search.search.windows.net",
+    "SEARCH_INDEX": "fortianswer-index",
+    "SEARCH_API_KEY": "xxxxxxx",
+    "SEARCH_API_VERSION": "2024-07-01",
     "RETRIEVAL_TIMEOUT_SECONDS": "15",
 
-    "LLM_MODE": "stub",
-    "LLM_ENDPOINT": "",
-    "LLM_API_KEY": "",
-    "LLM_MODEL": "",
-    "LLM_TIMEOUT_SECONDS": "20",
+    "RETRIEVAL_QUERY_MODE": "hybrid",
+ 
 
-    "DATA_BOUNDARY_DEFAULT": "Public"
+    "SEARCH_VECTOR_FIELD": "contentVector",
+
+    "SEARCH_SELECT": "id,content,source,path,chunkid,page,createdUtc",
+
+    "SEARCH_FIELD_ID": "id",
+    "SEARCH_FIELD_CONTENT": "content",
+    "SEARCH_FIELD_TITLE": "path",
+    "SEARCH_FIELD_URL": "source",
+    "SEARCH_FIELD_PATH": "path",
+    "SEARCH_FIELD_CHUNKID": "chunkid",
+
+    "SEARCH_MIN_SCORE": "0.01",
+
+    "SEARCH_ADMIN_KEY": "xxxxxxx",
+
+
+    "BLOB_CONNECTION": "DefaultEndpointsProtocol=https;AccountName=blobfortianswer;AccountKey=xxxxxxxxxx;EndpointSuffix=core.windows.net",
+    "BLOB_CONTAINER": "fortianswer-docs",
+
+    "DOCINTEL_ENDPOINT": "https://firtianswer-di.cognitiveservices.azure.com/",
+    "DOCINTEL_API_KEY": "xxxxxxxxxxxxxxxx",
+
+
+    "DATA_BOUNDARY_DEFAULT": "Public",
+    "GROQ_API_KEY": "xxxxxxxxxxxxxxxxxxxxxxxx",
+    "GROQ_MODEL": "llama-3.3-70b-versatile",
+
+    "WEBSEARCH_MODE": "tavily",
+    "TAVILY_API_KEY": "xxxxxxxxxxxxxxxxxxxxxx",
+    "WEBSEARCH_CONFIRM_SECRET": "xxxxxxxxd"
+
+
+
   }
 }

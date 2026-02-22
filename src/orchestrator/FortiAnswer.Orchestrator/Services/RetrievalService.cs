@@ -1,315 +1,259 @@
-namespace FortiAnswer.Orchestrator.Services;
-
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using FortiAnswer.Orchestrator.Models;
 
-public sealed class RetrievalBundle
-{
-    public string Context { get; set; } = "";
-    public List<Citation> Citations { get; set; } = new();
-}
+namespace FortiAnswer.Orchestrator.Services;
 
+/// <summary>
+/// Azure AI Search retrieval service (supports keyword/vector/hybrid).
+/// Adds mandatory DataBoundary (Public/Internal/Confidential/Restricted) filter using "classification" field.
+/// </summary>
 public sealed class RetrievalService
 {
     private readonly IHttpClientFactory _httpFactory;
-    private readonly IEmbeddingService _embeddings;
 
-    public RetrievalService(IHttpClientFactory httpFactory, IEmbeddingService embeddings)
+    public RetrievalService(IHttpClientFactory httpFactory)
     {
         _httpFactory = httpFactory;
-        _embeddings = embeddings;
     }
 
-    public async Task<RetrievalBundle> RetrieveAsync(
-        string question,
-        string? requestType,
-        string? userGroup,
-        int topK,
-        string correlationId)
+    // Small helper: read env with default.
+    private static string Env(string key, string def)
+        => (Environment.GetEnvironmentVariable(key) ?? def).Trim();
+
+    private static int EnvInt(string key, int def)
+        => int.TryParse(Environment.GetEnvironmentVariable(key), out var v) ? v : def;
+
+    private static double EnvDouble(string key, double def)
+        => double.TryParse(Environment.GetEnvironmentVariable(key), out var v) ? v : def;
+
+    private static string NormalizeBoundary(string? boundary)
     {
-        var mode = (Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub")
-            .Trim().ToLowerInvariant();
-
-        if (mode != "azureaisearch")
-            return Stub(question, requestType, userGroup, topK, correlationId);
-
-        var endpoint = Environment.GetEnvironmentVariable("SEARCH_ENDPOINT")?.Trim();
-        var indexName = Environment.GetEnvironmentVariable("SEARCH_INDEX")?.Trim();
-        var apiKey = Environment.GetEnvironmentVariable("SEARCH_API_KEY")?.Trim();
-        var apiVersion = Environment.GetEnvironmentVariable("SEARCH_API_VERSION")?.Trim() ?? "2024-07-01";
-
-        if (string.IsNullOrWhiteSpace(endpoint) ||
-            string.IsNullOrWhiteSpace(indexName) ||
-            string.IsNullOrWhiteSpace(apiKey) ||
-            endpoint.Contains("<") || indexName.Contains("<") || apiKey.Contains("<"))
+        var b = (boundary ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(b)) return "Public";
+        return b switch
         {
-            Console.WriteLine("[search] missing/placeholder SEARCH_* config; using stub retrieval");
-            return Stub(question, requestType, userGroup, topK, correlationId);
+            "public" => "Public",
+            "internal" => "Internal",
+            "confidential" => "Confidential",
+            "restricted" => "Restricted",
+            _ => char.ToUpperInvariant(b[0]) + b[1..]
+        };
+    }
+
+    /// <summary>
+    /// Build an OData filter based on DataBoundary and optional extra filter template.
+    /// You must have a filterable index field (default: "classification") with values:
+    /// public/internal/confidential/restricted
+    /// </summary>
+    private static string BuildBoundaryFilter(string boundary, string fieldClassification)
+    {
+        // NOTE: use lowercase stored values in index
+        return boundary switch
+        {
+            "Internal" => $"{fieldClassification} eq 'public' or {fieldClassification} eq 'internal'",
+            "Confidential" => $"{fieldClassification} eq 'public' or {fieldClassification} eq 'internal' or {fieldClassification} eq 'confidential'",
+            "Restricted" => $"{fieldClassification} eq 'restricted'",
+            _ => $"{fieldClassification} eq 'public'",
+        };
+    }
+
+    /// <summary>
+    /// Retrieve context + citations. Caller passes requestType as DataBoundary for now.
+    /// </summary>
+    public async Task<Dictionary<string, object>> RetrieveAsync(
+        string query,
+        string? requestType,
+        string? userRole,
+        string? userGroup,
+        CancellationToken ct = default)
+    {
+        // --------- ENV ---------
+        var mode = Env("RETRIEVAL_MODE", "azureaisearch"); // keep compatibility
+        if (!string.Equals(mode, "azureaisearch", StringComparison.OrdinalIgnoreCase))
+        {
+            return new Dictionary<string, object>
+            {
+                ["Mode"] = mode,
+                ["Context"] = "",
+                ["Citations"] = Array.Empty<object>(),
+                ["Debug"] = "RETRIEVAL_MODE is not azureaisearch."
+            };
         }
 
-        // keyword | vector | hybrid
-        var queryMode = (Environment.GetEnvironmentVariable("RETRIEVAL_QUERY_MODE") ?? "hybrid")
-            .Trim().ToLowerInvariant();
+        var endpoint = Env("SEARCH_ENDPOINT", "");
+        var index = Env("SEARCH_INDEX", "");
+        var apiKey = Env("SEARCH_API_KEY", "");
+        var apiVersion = Env("SEARCH_API_VERSION", "2024-07-01");
 
-        // vector field
-        var vectorField = (Environment.GetEnvironmentVariable("SEARCH_VECTOR_FIELD") ?? "contentVector").Trim();
-
-        // ---- Field mapping (match your index) ----
-        // Your index fields: id, content, source, path, chunkid, page, createdUtc, contentVector
-        var fieldId = (Environment.GetEnvironmentVariable("SEARCH_FIELD_ID") ?? "id").Trim();
-        var fieldContent = (Environment.GetEnvironmentVariable("SEARCH_FIELD_CONTENT") ?? "content").Trim();
-        var fieldTitle = (Environment.GetEnvironmentVariable("SEARCH_FIELD_TITLE") ?? "path").Trim();   // use path as title
-        var fieldUrl = (Environment.GetEnvironmentVariable("SEARCH_FIELD_URL") ?? "source").Trim();     // use source as url/id
-        var fieldPath = (Environment.GetEnvironmentVariable("SEARCH_FIELD_PATH") ?? "path").Trim();
-        var fieldChunkId = (Environment.GetEnvironmentVariable("SEARCH_FIELD_CHUNKID") ?? "chunkid").Trim();
-        var fieldPage = (Environment.GetEnvironmentVariable("SEARCH_FIELD_PAGE") ?? "page").Trim();
-        var fieldCreatedUtc = (Environment.GetEnvironmentVariable("SEARCH_FIELD_CREATEDUTC") ?? "createdUtc").Trim();
-
-        // ---- Select (IMPORTANT: do NOT include title/url because they don't exist in your index) ----
-        var select = Environment.GetEnvironmentVariable("SEARCH_SELECT")?.Trim();
-        if (string.IsNullOrWhiteSpace(select))
+        if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(index) || string.IsNullOrWhiteSpace(apiKey))
         {
-            select = string.Join(",",
-                fieldId,
-                fieldContent,
-                "source",
-                fieldPath,
-                fieldChunkId,
-                fieldPage,
-                fieldCreatedUtc
-            );
+            return new Dictionary<string, object>
+            {
+                ["Mode"] = mode,
+                ["Context"] = "",
+                ["Citations"] = Array.Empty<object>(),
+                ["Debug"] = "Missing SEARCH_ENDPOINT / SEARCH_INDEX / SEARCH_API_KEY."
+            };
         }
 
-        // Optional filter template (only if you add such fields to the index later)
-        // Example: "requestType eq '{requestType}' and userGroup eq '{userGroup}'"
-        var filterTemplate = Environment.GetEnvironmentVariable("SEARCH_FILTER_TEMPLATE")?.Trim();
-        string? filter = null;
+        var topK = EnvInt("INTERNAL_TOPK", 3);
+        var select = Env("SEARCH_SELECT", "id,content,source,path,chunkid,page,createdUtc");
+        var queryMode = Env("RETRIEVAL_QUERY_MODE", "hybrid"); // keyword|vector|hybrid
+        var vectorField = Env("SEARCH_VECTOR_FIELD", "contentVector");
+        var minScore = EnvDouble("SEARCH_MIN_SCORE", 0.0);
+
+        // --------- Boundary filter ---------
+        // We treat requestType as DataBoundary (Public/Internal/Confidential/Restricted)
+        var boundary = NormalizeBoundary(requestType ?? Env("SEARCH_DEFAULT_BOUNDARY", "Public"));
+        var fieldClassification = Env("SEARCH_FIELD_CLASSIFICATION", "classification");
+        var boundaryFilter = BuildBoundaryFilter(boundary, fieldClassification);
+
+        // Optional: allow adding extra filter template via env (kept for compatibility)
+        // Example: "({boundaryFilter}) and (tenant eq '{userGroup}')"
+        var filterTemplate = (Environment.GetEnvironmentVariable("SEARCH_FILTER_TEMPLATE") ?? "").Trim();
+        string finalFilter = boundaryFilter;
+
         if (!string.IsNullOrWhiteSpace(filterTemplate))
         {
-            filter = filterTemplate
-                .Replace("{requestType}", EscapeODataString(requestType ?? ""))
-                .Replace("{userGroup}", EscapeODataString(userGroup ?? ""));
-            if (string.IsNullOrWhiteSpace(filter)) filter = null;
+            // very simple token replace, but keep safe defaults
+            finalFilter = filterTemplate
+                .Replace("{boundaryFilter}", boundaryFilter, StringComparison.OrdinalIgnoreCase)
+                .Replace("{requestType}", boundary, StringComparison.OrdinalIgnoreCase)
+                .Replace("{userRole}", (userRole ?? "").Replace("'", "''"), StringComparison.OrdinalIgnoreCase)
+                .Replace("{userGroup}", (userGroup ?? "").Replace("'", "''"), StringComparison.OrdinalIgnoreCase);
         }
 
-        // ---- score threshold (optional) ----
-        // If set, drops hits with @search.score < minScore
-        var minScoreRaw = (Environment.GetEnvironmentVariable("SEARCH_MIN_SCORE") ?? "").Trim();
-        double? minScore = null;
-        if (double.TryParse(minScoreRaw, out var ms) && ms >= 0)
-            minScore = ms;
+        // --------- Build search request ---------
+        var url = $"{endpoint.TrimEnd('/')}/indexes/{index}/docs/search?api-version={apiVersion}";
+        var http = _httpFactory.CreateClient();
 
-        var client = _httpFactory.CreateClient();
-        var url = $"{endpoint.TrimEnd('/')}/indexes/{indexName}/docs/search?api-version={apiVersion}";
+        http.DefaultRequestHeaders.Clear();
+        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        http.DefaultRequestHeaders.Add("api-key", apiKey);
 
-        // 1) embed if vector/hybrid
-        float[]? qVec = null;
-        if (queryMode is "vector" or "hybrid")
+        // payload differs slightly by query mode
+        object payload = queryMode.ToLowerInvariant() switch
         {
-            try
+            "keyword" => new
             {
-                qVec = await _embeddings.EmbedAsync(question);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[search.embed.error] {ex.GetType().Name}: {ex.Message}. Falling back to keyword mode.");
-                queryMode = "keyword";
-            }
-        }
+                search = query,
+                top = topK,
+                select,
+                filter = finalFilter
+            },
 
-        // 2) payload
-        object payload = queryMode switch
-        {
             "vector" => new
             {
-                search = "*",
+                search = "",
                 top = topK,
-                vectorQueries = new[]
-                {
-                    new {
-                        kind = "vector",
-                        vector = qVec,
-                        fields = vectorField,
-                        k = topK
-                    }
-                },
                 select,
-                filter
+                filter = finalFilter,
+                vectorQueries = new object[]
+                {
+                    new { kind = "text", text = query, k = topK, fields = vectorField }
+                }
             },
 
-            "hybrid" => new
+            _ => new // hybrid default
             {
-                search = question,
+                search = query,
                 top = topK,
-                queryType = "simple",
-                vectorQueries = new[]
+                select,
+                filter = finalFilter,
+                vectorQueries = new object[]
                 {
-                    new {
-                        kind = "vector",
-                        vector = qVec,
-                        fields = vectorField,
-                        k = topK
-                    }
-                },
-                select,
-                filter
-            },
-
-            _ => new
-            {
-                search = question,
-                top = topK,
-                queryType = "simple",
-                select,
-                filter
+                    new { kind = "text", text = query, k = topK, fields = vectorField }
+                }
             }
         };
 
-        Console.WriteLine(
-            $"[search] queryMode={queryMode} endpoint={endpoint} index={indexName} topK={topK} " +
-            $"vectorField={vectorField} select={select} filter={(filter ?? "(none)")} minScore={(minScore?.ToString("0.###") ?? "(none)")}"
-        );
+        var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        using var resp = await http.PostAsync(url, new StringContent(json, Encoding.UTF8, "application/json"), ct);
 
-        var req = new HttpRequestMessage(HttpMethod.Post, url);
-        req.Headers.Add("x-correlation-id", correlationId);
-        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        req.Headers.Add("api-key", apiKey);
-        req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-
-        var resp = await client.SendAsync(req);
-        var json = await resp.Content.ReadAsStringAsync();
-
+        var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
         {
-            Console.WriteLine($"[search.error] status={(int)resp.StatusCode} body={json}");
-            return Stub(question, requestType, userGroup, topK, correlationId);
+            return new Dictionary<string, object>
+            {
+                ["Mode"] = mode,
+                ["Boundary"] = boundary,
+                ["Filter"] = finalFilter,
+                ["Context"] = "",
+                ["Citations"] = Array.Empty<object>(),
+                ["Debug"] = $"Search failed: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {body}"
+            };
         }
 
-        using var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
 
-        var citations = new List<Citation>();
-        if (doc.RootElement.TryGetProperty("value", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        // Azure Search response usually has "value": [ ... ]
+        if (!root.TryGetProperty("value", out var arr) || arr.ValueKind != JsonValueKind.Array)
         {
-            foreach (var item in arr.EnumerateArray())
+            return new Dictionary<string, object>
             {
-                var score = GetNumber(item, "@search.score");
-
-                // ---- score filter ----
-                if (minScore.HasValue)
-                {
-                    var s = score ?? 0;
-                    if (s < minScore.Value)
-                        continue;
-                }
-
-                var title = GetAnyAsString(item, fieldTitle) ?? "Document";
-                var urlOrId =
-                    GetAnyAsString(item, fieldUrl) ??
-                    GetAnyAsString(item, fieldId) ??
-                    "search://doc";
-
-                var snippet = GetAnyAsString(item, fieldContent) ?? "";
-
-                // Debug metadata
-                var path = GetAnyAsString(item, fieldPath);
-                var chunkId = GetAnyAsString(item, fieldChunkId);
-                var page = GetAnyAsString(item, fieldPage);
-                var createdUtc = GetAnyAsString(item, fieldCreatedUtc);
-
-                var meta =
-                    $"[score={(score?.ToString("0.###") ?? "")} path={path ?? ""} chunkid={chunkId ?? ""} page={page ?? ""} createdUtc={createdUtc ?? ""}]\n";
-
-                citations.Add(new Citation
-                {
-                    Title = title,
-                    UrlOrId = urlOrId,
-                    Snippet = Truncate(meta + snippet, 1400)
-                });
-
-                if (citations.Count >= topK) break;
-            }
+                ["Mode"] = mode,
+                ["Boundary"] = boundary,
+                ["Filter"] = finalFilter,
+                ["Context"] = "",
+                ["Citations"] = Array.Empty<object>(),
+                ["Debug"] = "No 'value' array in response."
+            };
         }
 
-        var header =
-            $"[internal-evidence]\n" +
-            $"requestType={requestType ?? ""}\n" +
-            $"userGroup={userGroup ?? ""}\n" +
-            $"topK={topK}\n" +
-            $"source=azureaisearch\n" +
-            $"retrievalQueryMode={queryMode}\n" +
-            $"vectorField={vectorField}\n" +
-            $"minScore={(minScore?.ToString("0.###") ?? "")}\n";
+        var citations = new List<Dictionary<string, object>>();
+        var sb = new StringBuilder();
 
-        var body = citations.Count == 0
-            ? "[no internal evidence found]"
-            : string.Join("\n\n", citations.Select((c, i) =>
-                $"[Chunk {i + 1}] {c.Title}\nSource: {c.UrlOrId}\n{c.Snippet}"
-            ));
-
-        return new RetrievalBundle
+        foreach (var item in arr.EnumerateArray())
         {
-            Context = header + "\n" + body,
-            Citations = citations
-        };
-    }
+            // Optional score check
+            double score = 0;
+            if (item.TryGetProperty("@search.score", out var scoreEl) && scoreEl.ValueKind == JsonValueKind.Number)
+                score = scoreEl.GetDouble();
 
-    private static RetrievalBundle Stub(string question, string? requestType, string? userGroup, int topK, string correlationId)
-    {
-        var citations = new List<Citation>
-        {
-            new Citation
+            if (score < minScore) continue;
+
+            string content = item.TryGetProperty("content", out var c) ? (c.GetString() ?? "") : "";
+            string source = item.TryGetProperty("source", out var s) ? (s.GetString() ?? "") : "";
+            string path = item.TryGetProperty("path", out var p) ? (p.GetString() ?? "") : "";
+            string id = item.TryGetProperty("id", out var idEl) ? (idEl.GetString() ?? "") : "";
+
+            // Build context
+            if (!string.IsNullOrWhiteSpace(content))
             {
-                Title = "Internal KB (stub)",
-                UrlOrId = "kb://stub/doc1#chunk1",
-                Snippet = Truncate(
-                    "Placeholder evidence. Replace with real retrieved text. When you integrate Azure AI Search chunks, this stub will be replaced.",
-                    500
-                )
+                sb.AppendLine(content.Trim());
+                sb.AppendLine();
             }
-        };
 
-        var context =
-            $"[internal-evidence stub]\n" +
-            $"topK={topK}\n" +
-            $"requestType={requestType ?? ""}\n" +
-            $"userGroup={userGroup ?? ""}\n" +
-            $"question={question}\n\n" +
-            string.Join("\n\n", citations.Select((c, i) => $"[Chunk {i + 1}] {c.Title}\n{c.Snippet}"));
+            // Build citations
+            var cite = new Dictionary<string, object>
+            {
+                ["id"] = id,
+                ["source"] = source,
+                ["path"] = path,
+                ["score"] = score
+            };
 
-        return new RetrievalBundle { Context = context, Citations = citations };
-    }
+            if (item.TryGetProperty("chunkid", out var ch) && ch.ValueKind == JsonValueKind.Number)
+             cite["chunkId"] = ch.GetInt32();
+            if (item.TryGetProperty("page", out var pg))
+            {
+                if (pg.ValueKind == JsonValueKind.Number) cite["page"] = pg.GetInt32();
+                else cite["page"] = pg.GetString() ?? "";
+            }
+            if (item.TryGetProperty("createdUtc", out var cu)) cite["createdUtc"] = cu.GetString() ?? "";
 
-    // supports string / number / bool
-    private static string? GetAnyAsString(JsonElement obj, string name)
-    {
-        if (obj.ValueKind != JsonValueKind.Object) return null;
-        if (!obj.TryGetProperty(name, out var p)) return null;
+            citations.Add(cite);
+        }
 
-        return p.ValueKind switch
+        return new Dictionary<string, object>
         {
-            JsonValueKind.String => p.GetString(),
-            JsonValueKind.Number => p.ToString(),
-            JsonValueKind.True => "true",
-            JsonValueKind.False => "false",
-            _ => null
+            ["Mode"] = mode,
+            ["Boundary"] = boundary,
+            ["Filter"] = finalFilter,
+            ["Context"] = sb.ToString().Trim(),
+            ["Citations"] = citations
         };
-    }
-
-    private static double? GetNumber(JsonElement obj, string name)
-    {
-        if (obj.ValueKind != JsonValueKind.Object) return null;
-        if (!obj.TryGetProperty(name, out var p)) return null;
-        if (p.ValueKind == JsonValueKind.Number && p.TryGetDouble(out var d)) return d;
-        return null;
-    }
-
-    private static string EscapeODataString(string s) => (s ?? "").Replace("'", "''");
-
-    private static string Truncate(string? s, int maxChars)
-    {
-        if (string.IsNullOrEmpty(s)) return "";
-        return s.Length <= maxChars ? s : s.Substring(0, maxChars) + "…";
     }
 }
