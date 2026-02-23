@@ -20,34 +20,13 @@
 ### 0) Health check (usually Anonymous)
 GET {{baseUrl}}/api/health
 
-
+### ping
+GET https://www.bing.com
 ############################################################
 # A) Ingest (optional)
 ############################################################
 
 ### A1) Ingest public/
-POST {{ingestUrl}}?code={{funcKey}}
-Content-Type: application/json
-
-{ "prefix": "public/", "maxFiles": 50 }
-
-### A2) Ingest internal/
-POST {{ingestUrl}}?code={{funcKey}}
-Content-Type: application/json
-
-{ "prefix": "internal/", "maxFiles": 50 }
-
-### A3) Ingest confidential/
-POST {{ingestUrl}}?code={{funcKey}}
-Content-Type: application/json
-
-{ "prefix": "confidential/", "maxFiles": 50 }
-
-### A4) Ingest restricted/
-POST {{ingestUrl}}?code={{funcKey}}
-Content-Type: application/json
-
-{ "prefix": "restricted/", "maxFiles": 50 }
 
 
 ############################################################
