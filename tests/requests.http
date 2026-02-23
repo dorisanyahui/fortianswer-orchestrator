@@ -1,422 +1,186 @@
+@baseUrl = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
 
+@chatUrl = {{baseUrl}}/api/chat
+@ingestUrl = {{baseUrl}}/api/ingest
 
-## Global variables
-
-@baseUrl = func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
-@contentType = application/json
-
-# Optional: set a client correlation id (the server will echo it back as x-client-correlation-id)
-
-@clientCid = ui-test-001
-
+############################################################
+# Sprint 1 Demo - End-to-End Test Script (AZURE)
+# - Role -> boundary (RBAC): Customer vs Agent vs Admin
+# - Data boundary -> Azure AI Search filter (classification)
+# - Web search only allowed when boundary == Public
+# - Restricted/Confidential policy gates
+# - NEW: if request dataBoundary == Restricted, server forces Restricted and ALWAYS escalates (no downgrade)
+#
 # NOTE:
+# - ingest endpoint is AuthorizationLevel.Function -> requires function key
+# - chat endpoint: if it is also AuthorizationLevel.Function, add ?code={{funcKey}} the same way
+############################################################
 
-# - The server generates requestId. Do NOT send "requestId" in the body (it will be ignored).
 
-# - Step2 token expires (default 5 minutes) and is bound to the exact "message" text.
-
----
-
-1. Health check
-
----
-
-### Health - GET
-
+### 0) Health check (usually Anonymous)
 GET {{baseUrl}}/api/health
 
----
 
-2. Chat - Public (Step 1): likely needs web confirmation
+############################################################
+# A) Ingest (optional)
+############################################################
 
----
+### A1) Ingest public/
+POST {{ingestUrl}}?code={{funcKey}}
+Content-Type: application/json
 
-### Public Step1 - expect needsWebConfirmation=true + webSearchToken
+{ "prefix": "public/", "maxFiles": 50 }
 
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-x-correlation-id: {{clientCid}}
+### A2) Ingest internal/
+POST {{ingestUrl}}?code={{funcKey}}
+Content-Type: application/json
+
+{ "prefix": "internal/", "maxFiles": 50 }
+
+### A3) Ingest confidential/
+POST {{ingestUrl}}?code={{funcKey}}
+Content-Type: application/json
+
+{ "prefix": "confidential/", "maxFiles": 50 }
+
+### A4) Ingest restricted/
+POST {{ingestUrl}}?code={{funcKey}}
+Content-Type: application/json
+
+{ "prefix": "restricted/", "maxFiles": 50 }
+
+
+############################################################
+# B) RBAC + Boundary enforcement (core Sprint1)
+############################################################
+
+### B1) Customer/Public: normal end-user question (VPN)
+# Expect: role=Customer, boundary=Public
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations, with a short timeline.",
-"requestType": "Public",
-"conversationId": "conv-public-001",
-"userRole": "User"
+  "message": "My VPN won't connect and keeps timing out. What should I try first?",
+  "issueType": "VPN",
+  "dataBoundary": "Public"
 }
 
-# EXPECT:
-
-# - 200 OK
-
-# - needsWebConfirmation: true
-
-# - webSearchToken: non-null
-
-# - requestId: server GUID
-
-# - actionHints includes: next:ask_user_for_web_search
-
----
-
-3. Chat - Public (Step 2): confirm web search
-
----
-
-### Public Step2 - confirm (PASTE token from Step1)
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-x-correlation-id: {{clientCid}}
+### B2) Customer tries to access Internal (should be downgraded to Public)
+# Expect: boundary=Public in actionHints, and NO internal citations.
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations, with a short timeline.",
-"requestType": "Public",
-"conversationId": "conv-public-001",
-"confirmWebSearch": true,
-"webSearchToken": "{{PASTE_WEBSEARCH_TOKEN_FROM_STEP1}}"
+  "message": "What is our Tier-1 phishing triage procedure?",
+  "issueType": "Phishing",
+  "dataBoundary": "Internal"
 }
 
-# EXPECT:
-
-# - 200 OK
-
-# - needsWebConfirmation: false
-
-# - actionHints includes: used:web_search
-
-# - citations includes web sources
-
-# - if internal lowOverlap/weakEvidence => internal citations filtered
-
----
-
-4. Chat - Internal (no web search allowed)
-
----
-
-### Internal - should NOT ask for web search (web disabled by policy)
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-x-correlation-id: {{clientCid}}
+### B3) Agent/Internal: same internal question should be allowed
+# Expect: role=Agent, boundary=Internal, and internal citations appear.
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
 
 {
-"message": "What is the retention period for FortiAnswer PDFs and archives?",
-"requestType": "Internal",
-"conversationId": "conv-internal-001",
-"userRole": "User"
+  "message": "What is our Tier-1 phishing triage procedure?",
+  "issueType": "Phishing",
+  "dataBoundary": "Internal"
 }
 
-# EXPECT:
-
-# - 200 OK
-
-# - needsWebConfirmation: false
-
-# - citations likely from internal documents (if present)
-
-# - actionHints includes used:internal_search
-
----
-
-5. Chat - Public but web search disabled by config
-
----
-
-### Public - web disabled scenario (only meaningful if WEBSEARCH_MODE != tavily or no key configured)
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### B4) Admin/Confidential: confidential topic allowed
+# Expect: role=Admin, boundary=Confidential, can return confidential citations.
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Admin
 
 {
-"message": "What happened in the most recent Microsoft outage?",
-"requestType": "Public",
-"conversationId": "conv-public-web-off-001"
+  "message": "We confirmed malicious activity. What is the containment coordination approach and who leads it?",
+  "issueType": "General",
+  "dataBoundary": "Confidential"
 }
 
-# EXPECT (if web not enabled):
-
-# - 200 OK
-
-# - needsWebConfirmation may be false
-
-# - actionHints may include: web_disabled_or_not_allowed
-
----
-
-6. Validation - Missing body
-
----
-
-### Missing Body - expect 400 MissingBody
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
----
-
-7. Validation - Invalid JSON
-
----
-
-### Invalid JSON - expect 400 InvalidJson
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### B5) Agent requests Confidential (MUST escalate; no downgrade)
+# Expect: escalation.ShouldEscalate=true, policy:confidential_request_requires_admin
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
 
 {
-"message": "hello",
-"requestType": "Public",
-
----
-
-8. Validation - Missing message
-
----
-
-### Missing message - expect 400 ValidationError
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
-{
-"requestType": "Public"
+  "message": "We confirmed malicious activity. What is the containment coordination approach and who leads it?",
+  "issueType": "General",
+  "dataBoundary": "Confidential"
 }
 
----
+### B6) Restricted: ALWAYS escalate (forced boundary, no downgrade)
+# Expect: escalation.ShouldEscalate=true, policy:restricted_escalate for ANY role (Customer/Agent/Admin).
 
-9. Public Step2 - confirmWebSearch=true but missing token
-
----
-
-### Step2 missing token - expect 400 ValidationError webSearchToken required
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### B6a) Customer asks Restricted -> still escalates (no fallback to Public)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations, with a short timeline.",
-"requestType": "Public",
-"confirmWebSearch": true
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted"
 }
 
----
-
-10. Public Step2 - invalid token (wrong token string)
-
----
-
-### Step2 invalid token - expect 400 Invalid or expired webSearchToken
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### B6b) Admin asks Restricted -> still escalates
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Admin
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations, with a short timeline.",
-"requestType": "Public",
-"confirmWebSearch": true,
-"webSearchToken": "this-is-not-a-valid-token"
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted"
 }
 
----
 
-11. Public Step2 - token for one message used with different message (message mismatch)
+############################################################
+# C) Web Search gating (Public only)
+############################################################
 
----
-
-### Step2 mismatch message - expect 400 Invalid or expired webSearchToken
-
-# Paste a real token from a Step1 run, then change the message slightly to trigger mismatch
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### C1) Public: likely needs web evidence -> should ask for web search confirmation
+# Expect: needsWebConfirmation=true + webSearchToken returned (if WEBSEARCH_MODE=tavily and key configured)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations with a short timeline.",
-"requestType": "Public",
-"confirmWebSearch": true,
-"webSearchToken": "{{PASTE_WEBSEARCH_TOKEN_FROM_STEP1}}"
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Public",
+  "confirmWebSearch": false
 }
 
-# NOTE: even removing a comma can cause mismatch because token binds to sha256(message).
-
----
-
-12. Public Step2 - token expired test
-
----
-
-### Step2 expired token - expect 400 Invalid or expired webSearchToken
-
-# Steps:
-
-# 1) Run Public Step1 to get token
-
-# 2) Wait longer than token TTL (default 5 minutes)
-
-# 3) Run this request
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### C2) Public: confirm web search (paste token + requestId from C1 response)
+# IMPORTANT: keep requestId only ONCE (your old version duplicated it)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Customer
 
 {
-"message": "Explain CVE-2024-3094 (xz backdoor) impact and mitigations, with a short timeline.",
-"requestType": "Public",
-"confirmWebSearch": true,
-"webSearchToken": "{{PASTE_EXPIRED_TOKEN_HERE}}"
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Public",
+  "confirmWebSearch": true,
+  "webSearchToken": "<PASTE_webSearchToken_FROM_C1>",
+  "requestId": "<PASTE_requestId_FROM_C1>"
 }
 
----
-
-13. Internal retrieval “off-topic” filtering behavior (demonstration)
-
----
-
-### Off-topic filter demo - ask a public security question but expect internal docs to be irrelevant
-
-### Step1 should show internal:lowOverlap=true and internal:citations_filtered=true
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
+### C3) Internal: same request but Agent should be blocked from web search
+# Expect: web_blocked:boundary_not_public (even with confirmWebSearch=true)
+POST {{chatUrl}}
+Content-Type: application/json
+x-user-role: Agent
 
 {
-"message": "Summarize the impact of the XZ backdoor on SSH servers and list mitigations.",
-"requestType": "Public",
-"conversationId": "conv-filter-demo-001"
+  "message": "What is the latest status and mitigation guidance for CVE-2024-3094 (xz backdoor)?",
+  "issueType": "General",
+  "dataBoundary": "Internal",
+  "confirmWebSearch": true
 }
-
-# EXPECT:
-
-# - actionHints includes internal:lowOverlap=true
-
-# - internal:citations_filtered=true
-
-# - needsWebConfirmation likely true (if web enabled)
-
----
-
-14. Public - no web needed (if internal has strong evidence)
-
----
-
-### Public - if internal KB contains strong evidence on this topic, should answer without needing web
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
-{
-"message": "FortiAnswer PDF retention and archive duration?",
-"requestType": "Public",
-"conversationId": "conv-public-no-web-001"
-}
-
-# EXPECT:
-
-# - needsWebConfirmation: false (if internal evidence is sufficient and overlap is good)
-
-# - citations may be internal (unless filtered)
-
----
-
-15. Extra fields ignored test (client sends unknown fields)
-
----
-
-### Unknown fields - should still 200 (unknown properties ignored by System.Text.Json)
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
-{
-"message": "What is FortiAnalyzer?",
-"requestType": "Public",
-"conversationId": "conv-extra-fields-001",
-"maxTokens": 250,
-"temperature": 0.2,
-"foo": "bar"
-}
-
-# EXPECT:
-
-# - 200 OK
-
-# - server ignores maxTokens/temperature/foo unless your model is extended to use them
-
----
-
-16. Client correlation id echo test
-
----
-
-### Client correlation id echo - server should return x-client-correlation-id header
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-x-correlation-id: client-trace-999
-
-{
-"message": "Hello, please answer briefly: what does this service do?",
-"requestType": "Public",
-"conversationId": "conv-trace-001"
-}
-
-# EXPECT:
-
-# - Response header x-correlation-id: server GUID
-
-# - Response header x-client-correlation-id: client-trace-999
-
-# - actionHints includes clientCorrelationId=client-trace-999
-
----
-
-17. Web enabled sanity check (only if WEBSEARCH_MODE=tavily configured)
-
----
-
-### Web sanity - Step1 then Step2 quickly
-
-### Run Step1, paste token, run Step2 within 5 minutes.
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
-{
-"message": "Give a short source-based timeline of CVE-2024-3094 and mitigations.",
-"requestType": "Public",
-"conversationId": "conv-web-sanity-001"
-}
-
-### Web sanity Step2
-
-POST {{baseUrl}}/api/chat
-Content-Type: {{contentType}}
-
-{
-"message": "Give a short source-based timeline of CVE-2024-3094 and mitigations.",
-"requestType": "Public",
-"conversationId": "conv-web-sanity-001",
-"confirmWebSearch": true,
-"webSearchToken": "{{PASTE_WEBSEARCH_TOKEN_FROM_STEP1}}"
-}
-
----
-
-## Notes (important)
-
-1. Do not include "requestId" in client request body:
-
-   * requestId is server-generated and returned in response.
-   * If you include requestId in request body, it is ignored by your current ChatRequest model.
-
-2. Step2 token is strict:
-
-   * Must be used within token TTL (default 5 minutes).
-   * Must use EXACT same message text as Step1.
-
-3. If you want a more UI-friendly token flow:
-
-   * Increase TTL (e.g., 15 minutes), and/or
-   * Bind token to requestId instead of message (requires small code change).
-
-If you want, paste your current IngestFunction request schema, and I will add a full “/api/ingest test pack” section too (success + validation + auth failure cases).
