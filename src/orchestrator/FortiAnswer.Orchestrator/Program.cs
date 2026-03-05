@@ -7,11 +7,9 @@ var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.ConfigureFunctionsWebApplication();
 
-// 先不要加 Application Insights（等 ingest 跑通再加）
-// builder.Services.AddApplicationInsightsTelemetryWorkerService();
-// builder.Services.ConfigureFunctionsApplicationInsights();
-
-// 基础 HttpClientFactory（可留可不留；有 typed client 也能自动带上）
+// ------------------------------------------------------------
+// Base services
+// ------------------------------------------------------------
 builder.Services.AddHttpClient();
 
 // ------------------------------------------------------------
@@ -20,33 +18,51 @@ builder.Services.AddHttpClient();
 builder.Services.AddSingleton<WebSearchService>();
 builder.Services.AddSingleton<RetrievalService>();
 builder.Services.AddSingleton<PromptBuilder>();
-builder.Services.AddSingleton<DocxTextExtractor>();
 
-// ------------------------------------------------------------
-// ✅ HTTP-calling services: use Typed HttpClient (关键)
-// ------------------------------------------------------------
-
-builder.Services.AddHttpClient<IEmbeddingService, OpenAiEmbeddingService>();
-builder.Services.AddHttpClient<AzureAiSearchIngestService>();
-builder.Services.AddHttpClient<PdfTextExtractor>();
-
-
-
-// GroqClient uses IHttpClientFactory -> use Singleton (NOT typed client)
+// GroqClient uses IHttpClientFactory -> singleton is fine
 builder.Services.AddSingleton<GroqClient>();
 
 // ------------------------------------------------------------
-// ingest services
+// ✅ Table Storage (Tickets / ConversationLogs / Feedback)
+// Reuse existing BLOB_CONNECTION (same storage account connection string)
+// ------------------------------------------------------------
+builder.Services.AddSingleton<TableStorageService>(sp =>
+{
+    var log = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TableStorageService>>();
+
+    var conn = Environment.GetEnvironmentVariable("BLOB_CONNECTION");
+    if (string.IsNullOrWhiteSpace(conn))
+        throw new InvalidOperationException("Missing BLOB_CONNECTION env var (used for TableStorageService).");
+
+    return new TableStorageService(conn, log);
+});
+
+// ------------------------------------------------------------
+// HTTP-calling services: Typed HttpClient
+// ------------------------------------------------------------
+builder.Services.AddHttpClient<IEmbeddingService, OpenAiEmbeddingService>();
+builder.Services.AddHttpClient<AzureAiSearchIngestService>();
+
+// If your PdfTextExtractor makes HTTP calls, keep it typed.
+// If it doesn't, you can register as singleton instead.
+// We'll keep typed as you had.
+builder.Services.AddHttpClient<PdfTextExtractor>();
+
+// ------------------------------------------------------------
+// Ingest services
 // ------------------------------------------------------------
 builder.Services.AddSingleton<BlobDocumentSource>();
 builder.Services.AddSingleton<TextChunker>();
 builder.Services.AddSingleton<IngestionOrchestrator>();
 
 // ------------------------------------------------------------
-// extractors
+// Extractors
+// (Remove duplicates; register concrete once + the interface)
 // ------------------------------------------------------------
-builder.Services.AddSingleton<PdfTextExtractor>();
 builder.Services.AddSingleton<DocxTextExtractor>();
 builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
+
+// NOTE: PdfTextExtractor is registered as typed HttpClient above.
+// Do NOT also AddSingleton<PdfTextExtractor>() again, to avoid confusion.
 
 builder.Build().Run();

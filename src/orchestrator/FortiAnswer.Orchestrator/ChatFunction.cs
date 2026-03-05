@@ -1,3 +1,5 @@
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -19,6 +21,7 @@ public sealed class ChatFunction
     private readonly WebSearchService _webSearch;
     private readonly PromptBuilder _promptBuilder;
     private readonly GroqClient _groq;
+    private readonly TableStorageService _tables;
 
     private static readonly JsonSerializerOptions JsonIn = new()
     {
@@ -36,28 +39,72 @@ public sealed class ChatFunction
         RetrievalService retrieval,
         WebSearchService webSearch,
         PromptBuilder promptBuilder,
-        GroqClient groq)
+        GroqClient groq,
+        TableStorageService tables)
     {
         _log = loggerFactory.CreateLogger<ChatFunction>();
         _retrieval = retrieval;
         _webSearch = webSearch;
         _promptBuilder = promptBuilder;
         _groq = groq;
+        _tables = tables;
     }
 
     [Function("chat")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "chat")] HttpRequestData req)
     {
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+
         var clientCorrelationId = GetClientCorrelationId(req);
         var requestId = Guid.NewGuid().ToString("N");
+
+        // We'll try to log at the end no matter what.
+        string? conversationId = null;
+        string? userRole = null;
+        string? requestedBoundary = null;
+        string? allowedBoundary = null;
+        string? boundary = null;
+        string? issueType = null;
+        string? userGroup = null;
+
+        string outcome = "unknown";
+        string usedRetrieval = "none";
+        double? bestScore = null;
+        double? minScore = null;
+        bool noEvidence = false;
+        bool weakEvidence = false;
+        bool lowOverlap = false;
+        bool needWeb = false;
+
+        string? retrievalBoundary = null;
+        string? retrievalFilter = null;
+        string? retrievalDebug = null;
+
+        bool isPublic = false;
+        string webMode = "off";
+        bool webEnabled = false;
+        bool webUsed = false;
+
+        string? webToken = null;
+        int internalCitationsRawCount = 0;
+        int internalCitationsFilteredCount = 0;
+        int webCitationsCount = 0;
+
+        string? errorCode = null;
+        string? errorMessage = null;
 
         try
         {
             // 1) Read body
             var bodyText = await new StreamReader(req.Body).ReadToEndAsync();
             if (string.IsNullOrWhiteSpace(bodyText))
-                return await BadRequest(req, requestId, clientCorrelationId, "MissingBody", "Request body is required.");
+            {
+                outcome = "bad_request";
+                errorCode = "MissingBody";
+                errorMessage = "Request body is required.";
+                return await BadRequest(req, requestId, clientCorrelationId, errorCode, errorMessage);
+            }
 
             ChatRequest? body;
             try
@@ -66,24 +113,36 @@ public sealed class ChatFunction
             }
             catch
             {
-                return await BadRequest(req, requestId, clientCorrelationId, "InvalidJson", "Invalid JSON body.");
+                outcome = "bad_request";
+                errorCode = "InvalidJson";
+                errorMessage = "Invalid JSON body.";
+                return await BadRequest(req, requestId, clientCorrelationId, errorCode, errorMessage);
             }
 
             // 2) Validate
             var message = body?.Message?.Trim();
             if (string.IsNullOrWhiteSpace(message))
-                return await BadRequest(req, requestId, clientCorrelationId, "ValidationError", "Field 'message' is required.", new { field = "message" });
+            {
+                outcome = "bad_request";
+                errorCode = "ValidationError";
+                errorMessage = "Field 'message' is required.";
+                return await BadRequest(req, requestId, clientCorrelationId, errorCode, errorMessage, new { field = "message" });
+            }
+
+            // ✅ ConversationId auto-generate (NEW)
+            conversationId = body?.ConversationId;
+            if (string.IsNullOrWhiteSpace(conversationId))
+            {
+                conversationId = "conv-" + requestId[..8];
+            }
 
             // 3) Resolve role + boundary (server-side)
-            // Header-driven role for Sprint1 demo: x-user-role: Customer|Agent|Admin
             var headerRole = GetHeader(req, "x-user-role");
-            var userRole = NormalizeRole(headerRole ?? body?.UserRole ?? "Customer");
+            userRole = NormalizeRole(headerRole ?? body?.UserRole ?? "Customer");
 
-            // IssueType (UI scenario)
-            var issueType = NormalizeIssueType(body?.IssueType);
+            issueType = NormalizeIssueType(body?.IssueType);
 
-            // ✅ Prefer DataBoundary, then legacy RequestType, then env default
-            var requestedBoundary = NormalizeBoundary(
+            requestedBoundary = NormalizeBoundary(
                 body?.DataBoundary
                 ?? body?.RequestType
                 ?? Environment.GetEnvironmentVariable("DATA_BOUNDARY_DEFAULT")
@@ -91,92 +150,82 @@ public sealed class ChatFunction
                 ?? "Public"
             );
 
-            // Compute the max boundary the caller is allowed to use (may be downgraded by role).
-            var allowedBoundary = DecideBoundary(userRole, requestedBoundary);
+            allowedBoundary = DecideBoundary(userRole, requestedBoundary);
 
-            // ✅ POLICY (Scheme B)
-            // - If client explicitly requests Restricted => ALWAYS Escalate (no downgrade).
-            // - If client explicitly requests Confidential but caller isn't Admin => Escalate (no downgrade).
-            // Otherwise, proceed with allowedBoundary.
-            var boundary = string.Equals(requestedBoundary, "Restricted", StringComparison.OrdinalIgnoreCase)
+            boundary = string.Equals(requestedBoundary, "Restricted", StringComparison.OrdinalIgnoreCase)
                 ? "Restricted"
                 : allowedBoundary;
 
-            var userGroup = body?.UserGroup;
-            var conversationId = body?.ConversationId;
+            userGroup = body?.UserGroup;
 
-            // TopK config for web only (RetrievalService has its own topK env)
+            // TopK config for web only
             var webTopK = ReadTopK("WEB_TOPK", 3, 1, 10);
-
-            var actionHints = new List<string>
-            {
-                $"cfg:webTopK={webTopK}",
-                $"serverRequestId={requestId}",
-                $"role={userRole}",
-                $"boundary={boundary}",
-                $"issueType={issueType}"
-            };
-
-            if (!string.IsNullOrWhiteSpace(clientCorrelationId))
-                actionHints.Add($"clientCorrelationId={clientCorrelationId}");
 
             // 4) Policy gates
             if (string.Equals(boundary, "Restricted", StringComparison.OrdinalIgnoreCase))
             {
-                actionHints.Add("policy:restricted_escalate");
+                outcome = "escalated";
+                usedRetrieval = "none";
 
-                var payloadRestricted = new ChatResponse
+                var answer =
+                    "This request falls under Restricted content. I can’t provide step-by-step playbook details in chat.\n" +
+                    "I’ll escalate this to an authorized responder. Please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.";
+
+                var response = new
                 {
-                    Answer =
-                        "This request falls under Restricted content. I can’t provide step-by-step playbook details in chat.\n" +
-                        "I’ll escalate this to an authorized responder. Please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.",
-                    Citations = new List<Citation>(),
-                    ActionHints = actionHints,
-                    RequestId = requestId,
-                    NeedsWebConfirmation = false,
-                    WebSearchToken = null,
-                    Escalation = new EscalationInfo { ShouldEscalate = true, Reason = "Restricted content requires escalation." },
-                    Mode = new ModeInfo
+                    requestId,
+                    conversationId,
+                    answer,
+                    citations = new List<Citation>(),
+                    needsWebConfirmation = false,
+                    webSearchToken = (string?)null,
+                    next = new { action = "none" }, // ✅ NEW
+                    escalation = new { shouldEscalate = true, reason = "Restricted content requires escalation." },
+                    mode = new
                     {
-                        Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
-                        Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                        retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                        llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
                     }
                 };
 
-                return await Ok(req, requestId, clientCorrelationId, payloadRestricted);
+                await SafeWriteLogAsync(requestId, conversationId, outcome);
+                return await Ok(req, requestId, clientCorrelationId, response);
             }
 
             if (string.Equals(requestedBoundary, "Confidential", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase))
             {
-                actionHints.Add("policy:confidential_request_requires_admin");
-                actionHints.Add($"requestedBoundary={requestedBoundary}");
-                actionHints.Add($"allowedBoundary={allowedBoundary}");
+                outcome = "escalated";
+                usedRetrieval = "none";
 
-            var payloadConf = new ChatResponse
-            {
-                Answer = """
-            This request explicitly requires Confidential handling, but you are not authorized (Admin) to access Confidential content.
+                var answer = """
+This request explicitly requires Confidential handling, but you are not authorized (Admin) to access Confidential content.
 
-            I'll escalate this request to an authorized responder.
-            """,
-                Citations = new List<Citation>(),
-                ActionHints = actionHints,
-                RequestId = requestId,
-                NeedsWebConfirmation = false,
-                WebSearchToken = null,
-                Escalation = new EscalationInfo { ShouldEscalate = true, Reason = "Confidential request requires Admin access." },
-                Mode = new ModeInfo
+I'll escalate this request to an authorized responder.
+""";
+
+                var response = new
                 {
-                    Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
-                    Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
-                }
-            };
+                    requestId,
+                    conversationId,
+                    answer,
+                    citations = new List<Citation>(),
+                    needsWebConfirmation = false,
+                    webSearchToken = (string?)null,
+                    next = new { action = "none" }, // ✅ NEW
+                    escalation = new { shouldEscalate = true, reason = "Confidential request requires Admin access." },
+                    mode = new
+                    {
+                        retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                        llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                    }
+                };
 
-                return await Ok(req, requestId, clientCorrelationId, payloadConf);
+                await SafeWriteLogAsync(requestId, conversationId, outcome);
+                return await Ok(req, requestId, clientCorrelationId, response);
             }
 
-            // 5) Internal retrieval (matches your RetrievalService signature)
+            // 5) Internal retrieval
             var internalBundle = await _retrieval.RetrieveAsync(
                 query: message!,
                 requestType: boundary,
@@ -185,95 +234,98 @@ public sealed class ChatFunction
                 ct: default
             );
 
-            // ✅ Debug (now works because ExtractString supports Dictionary)
-            actionHints.Add("retrieval:boundary=" + (ExtractString(internalBundle, "Boundary") ?? ""));
-            actionHints.Add("retrieval:filter=" + (ExtractString(internalBundle, "Filter") ?? ""));
-            actionHints.Add("retrieval:debug=" + (ExtractString(internalBundle, "Debug") ?? ""));
+            retrievalBoundary = ExtractString(internalBundle, "Boundary");
+            retrievalFilter = ExtractString(internalBundle, "Filter");
+            retrievalDebug = ExtractString(internalBundle, "Debug");
 
             var internalContext = ExtractString(internalBundle, "Context") ?? "";
-
-            // ✅ Critical fix: ExtractCitations supports Dictionary/List-of-dict returned by RetrievalService
             var internalCitationsRaw = ExtractCitations(internalBundle, "Citations");
+            internalCitationsRawCount = internalCitationsRaw.Count;
 
-            actionHints.Add(internalCitationsRaw.Count > 0 ? "used:internal_search" : "used:internal_search_empty");
+            usedRetrieval = "internal_search";
 
-            // 6) Decide if internal evidence is insufficient/off-topic
-            double minScore = GetDoubleEnv("SEARCH_MIN_SCORE", 0.01);
-            double bestScore = GetBestScore(internalCitationsRaw);
+            // 6) Evidence heuristics
+            minScore = GetDoubleEnv("SEARCH_MIN_SCORE", 0.01);
+            bestScore = GetBestScore(internalCitationsRaw);
 
             var internalTextForOverlap =
                 internalContext + "\n\n" +
                 string.Join("\n\n", internalCitationsRaw.ConvertAll(c => c.Snippet ?? ""));
 
-            bool noEvidence = internalCitationsRaw.Count == 0;
-            bool weakEvidence = !noEvidence && bestScore < minScore;
-            bool lowOverlap = IsLowOverlap(message!, internalTextForOverlap, minOverlap: 2);
+            noEvidence = internalCitationsRaw.Count == 0;
+            weakEvidence = !noEvidence && bestScore < minScore;
+            lowOverlap = IsLowOverlap(message!, internalTextForOverlap, minOverlap: 2);
 
-            actionHints.Add($"internal:bestScore={bestScore:0.###}");
-            actionHints.Add($"internal:minScore={minScore:0.###}");
-            actionHints.Add($"internal:lowOverlap={(lowOverlap ? "true" : "false")}");
-
-            bool needWeb = noEvidence || weakEvidence || lowOverlap;
+            needWeb = noEvidence || weakEvidence || lowOverlap;
 
             // Filter off-topic internal citations
             var internalCitationsFiltered = (lowOverlap || weakEvidence)
                 ? new List<Citation>()
                 : internalCitationsRaw;
 
-            if (lowOverlap || weakEvidence)
-                actionHints.Add("internal:citations_filtered=true");
+            internalCitationsFilteredCount = internalCitationsFiltered.Count;
 
             // 7) Web enablement (ONLY Public)
-            bool isPublic = string.Equals(boundary, "Public", StringComparison.OrdinalIgnoreCase);
-            var webMode = (Environment.GetEnvironmentVariable("WEBSEARCH_MODE") ?? "off").Trim().ToLowerInvariant();
-            bool webEnabled = isPublic && webMode == "tavily" && IsTavilyConfigured();
+            isPublic = string.Equals(boundary, "Public", StringComparison.OrdinalIgnoreCase);
+            webMode = (Environment.GetEnvironmentVariable("WEBSEARCH_MODE") ?? "off").Trim().ToLowerInvariant();
+            webEnabled = isPublic && webMode == "tavily" && IsTavilyConfigured();
 
             object? webBundle = null;
             string? webContext = null;
 
             var mergedCitations = new List<Citation>(internalCitationsFiltered);
 
-            // Step 1: need web but not confirmed => ask
+            // Step 1: need web but not confirmed => ask user
             if (needWeb && webEnabled && body?.ConfirmWebSearch != true)
             {
-                actionHints.Add("next:ask_user_for_web_search");
+                outcome = "needs_web_confirmation";
 
-                var token = MakeWebConfirmToken(message!, requestId);
+                webToken = MakeWebConfirmToken(message!, requestId);
 
-                var payloadAsk = new ChatResponse
+                var answer =
+                    "Internal knowledge base did not return enough relevant evidence to answer this question.\n" +
+                    "Would you like me to run a Web Search (Tavily) to supplement the answer?\n\n" +
+                    "If yes, resend the request with confirmWebSearch=true and include webSearchToken.";
+
+                var response = new
                 {
-                    Answer =
-                        "Internal knowledge base did not return enough relevant evidence to answer this question.\n" +
-                        "Would you like me to run a Web Search (Tavily) to supplement the answer?\n\n" +
-                        "If yes, resend the request with confirmWebSearch=true and include webSearchToken.",
-                    Citations = mergedCitations,
-                    ActionHints = actionHints,
-                    RequestId = requestId,
-                    NeedsWebConfirmation = true,
-                    WebSearchToken = token,
-                    Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
-                    Mode = new ModeInfo
+                    requestId,
+                    conversationId,
+                    answer,
+                    citations = mergedCitations,
+                    needsWebConfirmation = true,
+                    webSearchToken = webToken,
+                    next = new { action = "none" }, // ✅ NEW
+                    escalation = new { shouldEscalate = false, reason = "" },
+                    mode = new
                     {
-                        Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
-                        Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                        retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                        llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
                     }
                 };
 
-                return await Ok(req, requestId, clientCorrelationId, payloadAsk);
+                await SafeWriteLogAsync(requestId, conversationId, outcome);
+                return await Ok(req, requestId, clientCorrelationId, response);
             }
 
             // Step 2: confirmed => validate token => run web search
             if (needWeb && webEnabled && body?.ConfirmWebSearch == true)
             {
                 if (string.IsNullOrWhiteSpace(body.WebSearchToken))
-                    return await BadRequest(req, requestId, clientCorrelationId, "ValidationError",
-                        "Field 'webSearchToken' is required when confirmWebSearch=true.",
-                        new { field = "webSearchToken" });
+                {
+                    outcome = "bad_request";
+                    errorCode = "ValidationError";
+                    errorMessage = "Field 'webSearchToken' is required when confirmWebSearch=true.";
+                    return await BadRequest(req, requestId, clientCorrelationId, errorCode, errorMessage, new { field = "webSearchToken" });
+                }
 
                 if (!ValidateWebConfirmToken(body.WebSearchToken!, message!))
-                    return await BadRequest(req, requestId, clientCorrelationId, "ValidationError",
-                        "Invalid or expired webSearchToken.",
-                        new { field = "webSearchToken" });
+                {
+                    outcome = "bad_request";
+                    errorCode = "ValidationError";
+                    errorMessage = "Invalid or expired webSearchToken.";
+                    return await BadRequest(req, requestId, clientCorrelationId, errorCode, errorMessage, new { field = "webSearchToken" });
+                }
 
                 webBundle = await _webSearch.SearchAsync(
                     query: message!,
@@ -283,16 +335,13 @@ public sealed class ChatFunction
 
                 webContext = ExtractString(webBundle, "Context");
                 var webCitations = ExtractCitations(webBundle, "Citations");
+                webCitationsCount = webCitations.Count;
 
                 if (webCitations.Count > 0)
                     mergedCitations.AddRange(webCitations);
 
-                actionHints.Add("used:web_search");
-            }
-            else
-            {
-                if (needWeb && !isPublic) actionHints.Add("web_blocked:boundary_not_public");
-                else actionHints.Add(needWeb ? "web_disabled_or_not_allowed" : "next:optional_web_search");
+                usedRetrieval = "web_search";
+                webUsed = true;
             }
 
             // 8) Build prompt
@@ -332,31 +381,120 @@ public sealed class ChatFunction
             var prompt = basePrompt + escalationHint + issueHint + guardrails;
 
             // 9) Groq generate
-            var answer = await _groq.GenerateAsync(prompt, requestId) ?? "";
+            var answerText = await _groq.GenerateAsync(prompt, requestId) ?? "";
 
-            // 10) Response
-            var payload = new ChatResponse
+            // 10) Response (NO DEBUG returned)
+            outcome = "answered";
+
+            var responseFinal = new
             {
-                Answer = answer,
-                Citations = mergedCitations,
-                ActionHints = actionHints,
-                RequestId = requestId,
-                NeedsWebConfirmation = false,
-                WebSearchToken = null,
-                Escalation = new EscalationInfo { ShouldEscalate = false, Reason = "" },
-                Mode = new ModeInfo
+                requestId,
+                conversationId,
+                answer = answerText,
+                citations = mergedCitations,
+                needsWebConfirmation = false,
+                webSearchToken = (string?)null,
+                next = new { action = "none" }, // ✅ NEW
+                escalation = new { shouldEscalate = false, reason = "" },
+                mode = new
                 {
-                    Retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
-                    Llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
+                    retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                    llm = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq"
                 }
             };
 
-            return await Ok(req, requestId, clientCorrelationId, payload);
+            await SafeWriteLogAsync(requestId, conversationId, outcome);
+            return await Ok(req, requestId, clientCorrelationId, responseFinal);
         }
         catch (Exception ex)
         {
+            outcome = "error";
+            errorCode = "InternalError";
+            errorMessage = "Unexpected error.";
+
             _log.LogError(ex, "ChatFunction failed. requestId={requestId} clientCorrelationId={clientCorrelationId}", requestId, clientCorrelationId);
-            return await InternalError(req, requestId, clientCorrelationId, "InternalError", "Unexpected error.");
+
+            await SafeWriteLogAsync(requestId, conversationId, outcome, ex);
+
+            return await InternalError(req, requestId, clientCorrelationId, errorCode, errorMessage);
+        }
+        finally
+        {
+            swTotal.Stop();
+        }
+
+        async Task SafeWriteLogAsync(string reqId, string? convId, string outc, Exception? ex = null)
+        {
+            try
+            {
+                swTotal.Stop();
+                var latencyMs = swTotal.ElapsedMilliseconds;
+
+                var debugObj = new
+                {
+                    serverRequestId = reqId,
+                    clientCorrelationId,
+                    role = userRole,
+                    requestedBoundary,
+                    allowedBoundary,
+                    boundary,
+                    issueType,
+                    userGroup,
+                    conversationId = convId,
+                    outcome = outc,
+                    retrieval = new
+                    {
+                        used = usedRetrieval,
+                        internalBundle = new
+                        {
+                            boundary = retrievalBoundary,
+                            filter = retrievalFilter,
+                            debug = retrievalDebug
+                        },
+                        scores = new { bestScore, minScore },
+                        heuristics = new { noEvidence, weakEvidence, lowOverlap, needWeb },
+                        citations = new
+                        {
+                            internalRaw = internalCitationsRawCount,
+                            internalFiltered = internalCitationsFilteredCount,
+                            web = webCitationsCount
+                        }
+                    },
+                    web = new
+                    {
+                        isPublic,
+                        webMode,
+                        webEnabled,
+                        webUsed,
+                        webTokenIssued = !string.IsNullOrWhiteSpace(webToken)
+                    },
+                    timingMs = new { total = latencyMs },
+                    error = ex is null ? null : new
+                    {
+                        type = ex.GetType().FullName,
+                        message = ex.Message,
+                        stack = ex.StackTrace
+                    }
+                };
+
+                await _tables.WriteConversationLogAsync(
+                    requestId: reqId,
+                    conversationId: convId ?? "",
+                    outcome: outc,
+                    role: userRole ?? "Unknown",
+                    dataBoundary: boundary ?? "Unknown",
+                    requestType: issueType ?? "General",
+                    usedRetrieval: usedRetrieval,
+                    topScore: bestScore,
+                    ticketId: null,
+                    latencyMs: latencyMs,
+                    debugObj: debugObj
+                );
+            }
+            catch (Exception logEx)
+            {
+                _log.LogWarning(logEx, "Failed to write ConversationLog. requestId={requestId}", requestId);
+            }
         }
     }
 
@@ -427,11 +565,6 @@ public sealed class ChatFunction
         _ => 0
     };
 
-    // Minimal Sprint1 policy:
-    // Customer => Public only
-    // Agent => up to Internal
-    // Admin => up to Confidential
-    // Restricted always escalates (handled earlier)
     private static string DecideBoundary(string userRole, string requestedBoundary)
     {
         int req = BoundaryRank(requestedBoundary);
@@ -472,7 +605,6 @@ public sealed class ChatFunction
 
         try
         {
-            // Dictionary<string, object>
             if (obj is IDictionary<string, object> dict)
             {
                 if (dict.TryGetValue(propertyName, out var v) && v is not null)
@@ -480,7 +612,6 @@ public sealed class ChatFunction
                 return null;
             }
 
-            // JsonElement object
             if (obj is JsonElement je)
             {
                 if (je.ValueKind == JsonValueKind.Object && je.TryGetProperty(propertyName, out var prop))
@@ -488,7 +619,6 @@ public sealed class ChatFunction
                 return null;
             }
 
-            // reflection property
             var propInfo = obj.GetType().GetProperty(propertyName);
             return propInfo?.GetValue(obj)?.ToString();
         }
@@ -507,25 +637,21 @@ public sealed class ChatFunction
         {
             object? raw = null;
 
-            // Dictionary bundle
             if (obj is IDictionary<string, object> dict)
             {
                 dict.TryGetValue(propertyName, out raw);
             }
             else
             {
-                // reflection property
                 var prop = obj.GetType().GetProperty(propertyName);
                 raw = prop?.GetValue(obj);
             }
 
             if (raw is null) return list;
 
-            // Already typed
             if (raw is IEnumerable<Citation> typed)
                 return new List<Citation>(typed);
 
-            // JSON array
             if (raw is JsonElement je && je.ValueKind == JsonValueKind.Array)
             {
                 foreach (var item in je.EnumerateArray())
@@ -541,22 +667,18 @@ public sealed class ChatFunction
                 return list;
             }
 
-            // IEnumerable of dictionaries / anonymous objects
             if (raw is System.Collections.IEnumerable any)
             {
                 foreach (var item in any)
                 {
                     if (item is null) continue;
 
-                    // Most important: RetrievalService returns Dictionary<string, object>
                     if (item is IDictionary<string, object> d)
                     {
-                        // Prefer path as title, source as urlOrId if you want
                         var path = d.TryGetValue("path", out var pv) ? pv?.ToString() : null;
                         var source = d.TryGetValue("source", out var sv) ? sv?.ToString() : null;
                         var id = d.TryGetValue("id", out var iv) ? iv?.ToString() : null;
 
-                        // Score may be double or string
                         var scoreStr = "";
                         if (d.TryGetValue("score", out var sc) && sc is not null)
                             scoreStr = sc.ToString() ?? "";
@@ -573,7 +695,6 @@ public sealed class ChatFunction
                         continue;
                     }
 
-                    // Fallback reflection
                     var t = item.GetType();
 
                     string? title = t.GetProperty("Title")?.GetValue(item)?.ToString()
@@ -588,10 +709,10 @@ public sealed class ChatFunction
                         ?? t.GetProperty("Id")?.GetValue(item)?.ToString()
                         ?? t.GetProperty("id")?.GetValue(item)?.ToString();
 
-                        string? snippetText = t.GetProperty("Snippet")?.GetValue(item)?.ToString()
-                                        ?? t.GetProperty("snippet")?.GetValue(item)?.ToString();
+                    string? snippetText = t.GetProperty("Snippet")?.GetValue(item)?.ToString()
+                                       ?? t.GetProperty("snippet")?.GetValue(item)?.ToString();
 
-                        list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippetText });
+                    list.Add(new Citation { Title = title, UrlOrId = urlOrId, Snippet = snippetText });
                 }
             }
         }
@@ -748,9 +869,6 @@ public sealed class ChatFunction
     }
 
     // ---------------- Web confirmation token (HMAC) ----------------
-    // Env: WEBSEARCH_CONFIRM_SECRET
-    // Token: base64url(payloadJson) + "." + base64url(hmacSha256(payloadJson))
-    // payloadJson: {"exp":<unixSeconds>,"mh":"<sha256(message)>"}
 
     private static string MakeWebConfirmToken(string message, string requestId)
     {
