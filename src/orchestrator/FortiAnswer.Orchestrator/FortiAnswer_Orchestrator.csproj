@@ -26,6 +26,7 @@
 
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.0.2" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Storage.Blobs" Version="6.8.0" />
+    <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
 
     <!-- ✅ 新增：让 NuGet 正规提供 ProtectedData.dll -->
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />

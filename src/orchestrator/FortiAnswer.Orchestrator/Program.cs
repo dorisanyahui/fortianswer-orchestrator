@@ -62,6 +62,8 @@ builder.Services.AddSingleton<IngestionOrchestrator>();
 builder.Services.AddSingleton<DocxTextExtractor>();
 builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
 
+
+builder.Services.AddSingleton<UsersTableService>();
 // NOTE: PdfTextExtractor is registered as typed HttpClient above.
 // Do NOT also AddSingleton<PdfTextExtractor>() again, to avoid confusion.
 
