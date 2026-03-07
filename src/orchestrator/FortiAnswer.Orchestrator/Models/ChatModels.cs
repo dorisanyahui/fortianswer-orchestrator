@@ -48,6 +48,13 @@ public sealed class ChatRequest
     public string? ConversationId { get; set; }
 
     /// <summary>
+    /// Optional: username of the authenticated user sending the chat.
+    /// Used to attribute auto-created escalation tickets.
+    /// TODO: replace with JWT claims once token auth is implemented.
+    /// </summary>
+    public string? Username { get; set; }
+
+    /// <summary>
     /// When true, user confirms allowing external web search (Public only).
     /// </summary>
     public bool? ConfirmWebSearch { get; set; }

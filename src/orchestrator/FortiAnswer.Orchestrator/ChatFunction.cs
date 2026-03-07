@@ -22,6 +22,7 @@ public sealed class ChatFunction
     private readonly PromptBuilder _promptBuilder;
     private readonly GroqClient _groq;
     private readonly TableStorageService _tables;
+    private readonly TicketsTableService _tickets;
 
     private static readonly JsonSerializerOptions JsonIn = new()
     {
@@ -40,7 +41,8 @@ public sealed class ChatFunction
         WebSearchService webSearch,
         PromptBuilder promptBuilder,
         GroqClient groq,
-        TableStorageService tables)
+        TableStorageService tables,
+        TicketsTableService tickets)
     {
         _log = loggerFactory.CreateLogger<ChatFunction>();
         _retrieval = retrieval;
@@ -48,6 +50,7 @@ public sealed class ChatFunction
         _promptBuilder = promptBuilder;
         _groq = groq;
         _tables = tables;
+        _tickets = tickets;
     }
 
     [Function("chat")]
@@ -156,6 +159,12 @@ public sealed class ChatFunction
                 ? "Restricted"
                 : allowedBoundary;
 
+            // Server-side override: certain issueTypes always force Restricted
+            // regardless of what boundary the client sent or what the role allows.
+            // This ensures the web UI never needs to expose a "Restricted" option.
+            if (IsAlwaysRestricted(issueType))
+                boundary = "Restricted";
+
             userGroup = body?.UserGroup;
 
             // TopK config for web only
@@ -167,9 +176,28 @@ public sealed class ChatFunction
                 outcome = "escalated";
                 usedRetrieval = "none";
 
-                var answer =
-                    "This request falls under Restricted content. I can’t provide step-by-step playbook details in chat.\n" +
-                    "I’ll escalate this to an authorized responder. Please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.";
+                // Admin: just explain, no ticket.
+                // Customer / Agent: auto-create ticket.
+                string? autoTicketId = null;
+                if (!string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase))
+                {
+                    autoTicketId = await SafeCreateTicketAsync(
+                        convId:           conversationId,
+                        createdByUser:    body?.Username?.Trim().ToLowerInvariant() ?? "anonymous",
+                        issueType:        issueType ?? "General",
+                        dataBoundary:     "Restricted",
+                        summary:          $"Auto-escalated: Restricted content request. Message: {message![..Math.Min(200, message.Length)]}",
+                        escalationReason: "Restricted content requires escalation.",
+                        source:           "auto");
+                }
+
+                var answer = string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase)
+                    ? "This request involves Restricted content, which cannot be served through the chat interface — even for Admins.\n\n" +
+                      "Restricted playbooks and procedures must be accessed through the secure out-of-band channel (e.g., your IR runbook vault or incident bridge).\n\n" +
+                      "If this is an active incident, initiate the incident response process directly and coordinate with your security team."
+                    : "This request falls under Restricted content. I can’t provide step-by-step playbook details in chat.\n\n" +
+                      "A ticket has been created and will be assigned to an authorized responder.\n\n" +
+                      "To help them act quickly, please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.";
 
                 var response = new
                 {
@@ -179,7 +207,9 @@ public sealed class ChatFunction
                     citations = new List<Citation>(),
                     needsWebConfirmation = false,
                     webSearchToken = (string?)null,
-                    next = new { action = "none" }, // ✅ NEW
+                    next = autoTicketId is not null
+                        ? (object)new { action = "escalate", ticketId = autoTicketId }
+                        : new { action = "none" },
                     escalation = new { shouldEscalate = true, reason = "Restricted content requires escalation." },
                     mode = new
                     {
@@ -188,7 +218,7 @@ public sealed class ChatFunction
                     }
                 };
 
-                await SafeWriteLogAsync(requestId, conversationId, outcome);
+                await SafeWriteLogAsync(requestId, conversationId, outcome, ticketId: autoTicketId);
                 return await Ok(req, requestId, clientCorrelationId, response);
             }
 
@@ -198,10 +228,20 @@ public sealed class ChatFunction
                 outcome = "escalated";
                 usedRetrieval = "none";
 
+                // Customer / Agent requesting Confidential → auto-create ticket.
+                var autoTicketId = await SafeCreateTicketAsync(
+                    convId:           conversationId,
+                    createdByUser:    body?.Username?.Trim().ToLowerInvariant() ?? "anonymous",
+                    issueType:        issueType ?? "General",
+                    dataBoundary:     "Confidential",
+                    summary:          $"Auto-escalated: Confidential request by non-Admin ({userRole}). Message: {message![..Math.Min(200, message.Length)]}",
+                    escalationReason: "Confidential request requires Admin access.",
+                    source:           "auto");
+
                 var answer = """
 This request explicitly requires Confidential handling, but you are not authorized (Admin) to access Confidential content.
 
-I'll escalate this request to an authorized responder.
+I’ll escalate this request to an authorized responder.
 """;
 
                 var response = new
@@ -212,7 +252,7 @@ I'll escalate this request to an authorized responder.
                     citations = new List<Citation>(),
                     needsWebConfirmation = false,
                     webSearchToken = (string?)null,
-                    next = new { action = "none" }, // ✅ NEW
+                    next = (object)new { action = "escalate", ticketId = autoTicketId },
                     escalation = new { shouldEscalate = true, reason = "Confidential request requires Admin access." },
                     mode = new
                     {
@@ -221,7 +261,7 @@ I'll escalate this request to an authorized responder.
                     }
                 };
 
-                await SafeWriteLogAsync(requestId, conversationId, outcome);
+                await SafeWriteLogAsync(requestId, conversationId, outcome, ticketId: autoTicketId);
                 return await Ok(req, requestId, clientCorrelationId, response);
             }
 
@@ -423,7 +463,34 @@ I'll escalate this request to an authorized responder.
             swTotal.Stop();
         }
 
-        async Task SafeWriteLogAsync(string reqId, string? convId, string outc, Exception? ex = null)
+        async Task<string?> SafeCreateTicketAsync(
+            string? convId,
+            string createdByUser,
+            string issueType,
+            string dataBoundary,
+            string summary,
+            string escalationReason,
+            string source)
+        {
+            try
+            {
+                return await _tickets.CreateAsync(
+                    conversationId:   convId,
+                    createdByUser:    createdByUser,
+                    issueType:        issueType,
+                    dataBoundary:     dataBoundary,
+                    summary:          summary,
+                    escalationReason: escalationReason,
+                    source:           source);
+            }
+            catch (Exception ticketEx)
+            {
+                _log.LogWarning(ticketEx, "Failed to auto-create ticket. requestId={requestId}", requestId);
+                return null;
+            }
+        }
+
+        async Task SafeWriteLogAsync(string reqId, string? convId, string outc, Exception? ex = null, string? ticketId = null)
         {
             try
             {
@@ -486,7 +553,7 @@ I'll escalate this request to an authorized responder.
                     requestType: issueType ?? "General",
                     usedRetrieval: usedRetrieval,
                     topScore: bestScore,
-                    ticketId: null,
+                    ticketId: ticketId,
                     latencyMs: latencyMs,
                     debugObj: debugObj
                 );
@@ -518,6 +585,15 @@ I'll escalate this request to an authorized responder.
             _ => char.ToUpperInvariant(role[0]) + role[1..]
         };
     }
+
+    /// <summary>
+    /// IssueTypes that always force Restricted boundary regardless of user role or
+    /// requested boundary. The web UI never needs to expose a "Restricted" option —
+    /// the server decides based on what the user is asking about.
+    /// SuspiciousLogin / Severity = active threat indicators requiring human escalation.
+    /// </summary>
+    private static bool IsAlwaysRestricted(string? issueType) =>
+        issueType is "SuspiciousLogin" or "Severity";
 
     private static string NormalizeBoundary(string boundary)
     {

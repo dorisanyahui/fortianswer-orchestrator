@@ -1,0 +1,66 @@
+@baseUrl = http://localhost:7071
+# @baseUrl = https://<YOUR-FUNC>.azurewebsites.net
+
+### A1) Auth Register (create user) - Expect: 201 Created
+POST {{baseUrl}}/api/auth/register
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "password": "P@ssw0rd123",
+  "email": "pingchili@edu.sait.ca",
+  "company": "F12.net",
+  "telephone": "1234567890",
+  "role": "Admin"
+}
+
+### A2) Auth Register duplicate - Expect: 409 Conflict
+POST {{baseUrl}}/api/auth/register
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "password": "P@ssw0rd123",
+  "email": "pingchili@edu.sait.ca",
+  "company": "F12.net",
+  "telephone": "1234567890",
+  "role": "Admin"
+}
+
+### A3) Auth Login (correct password) - Expect: 200 OK + authenticated=true
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "password": "P@ssw0rd123"
+}
+
+### A4) Auth Login (wrong password) - Expect: 401 Unauthorized
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "password": "WrongPass111"
+}
+
+### A5) Auth Login (unknown user) - Expect: 401 Unauthorized
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "not-exist-user",
+  "password": "P@ssw0rd123"
+}
+
+### A6) Auth Register (weak password) - Expect: 400 BadRequest
+POST {{baseUrl}}/api/auth/register
+Content-Type: application/json
+
+{
+  "username": "weakpassuser",
+  "password": "123",
+  "email": "weak@edu.sait.ca",
+  "company": "F12.net"
+}

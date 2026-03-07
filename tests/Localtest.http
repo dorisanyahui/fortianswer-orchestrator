@@ -182,3 +182,147 @@ x-user-role: Agent
   "dataBoundary": "Internal",
   "confirmWebSearch": true
 }
+
+
+
+
+############################################################
+# D) Ticket Escalation
+############################################################
+
+### D1) Auto-ticket: Customer hits Restricted → ticket created, next.action = "escalate"
+# Expect: 200, escalation.shouldEscalate=true, next.action="escalate", next.ticketId=<id>
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "Phishing",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### D2) Auto-ticket: Agent hits Restricted → ticket created
+# Expect: same as D1 (Agent also gets a ticket, not Admin)
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "Phishing",
+  "dataBoundary": "Restricted",
+  "userRole": "Agent",
+  "username": "pingchili"
+}
+
+### D3) Admin hits Restricted → NO ticket, just explanation
+# Expect: escalation.shouldEscalate=true, next.action="none", NO ticketId
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted",
+  "userRole": "Admin",
+  "username": "pingchili"
+}
+
+### D4) Auto-ticket: Customer requests Confidential → ticket created
+# Expect: escalation.shouldEscalate=true, next.action="escalate", next.ticketId=<id>
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Show me the containment coordination plan.",
+  "issueType": "Severity",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### D5) Manual ticket: create a ticket directly
+# Expect: 201 Created, { ticketId, status="Open", priority, ... }
+POST {{baseUrl}}/api/tickets
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "summary": "VPN not connecting after password reset",
+  "issueType": "VPN",
+  "dataBoundary": "Public"
+}
+
+### D6) Manual ticket: unknown user → 401
+# Expect: 401 Unauthorized
+POST {{baseUrl}}/api/tickets
+Content-Type: application/json
+
+{
+  "username": "no-such-user",
+  "summary": "Test ticket",
+  "issueType": "General"
+}
+
+### D7) Manual ticket: missing summary → 400
+# Expect: 400 BadRequest, error.code="ValidationError"
+POST {{baseUrl}}/api/tickets
+Content-Type: application/json
+
+{
+  "username": "pingchili"
+}
+
+### D8) Get ticket by ID — paste the ticketId from D5 response
+# Expect: 200 with full ticket object
+@ticketId = PASTE_TICKET_ID_HERE
+GET {{baseUrl}}/api/tickets/{{ticketId}}
+
+### D9) Get ticket: non-existent ID → 404
+# Expect: 404 Not Found
+GET {{baseUrl}}/api/tickets/000000000000
+
+
+############################################################
+# E) Server-side Restricted detection (no dataBoundary needed)
+############################################################
+
+### E1) Customer + SuspiciousLogin → server forces Restricted → auto-ticket
+# Expect: next.action="escalate", ticketId set, even though dataBoundary="Public"
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown country and approved MFA. What do I do?",
+  "issueType": "SuspiciousLogin",
+  "dataBoundary": "Public",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### E2) Agent + Severity → server forces Restricted → auto-ticket
+# Expect: next.action="escalate", ticketId set, even though dataBoundary="Internal"
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "We have a confirmed breach. What is the escalation path?",
+  "issueType": "Severity",
+  "dataBoundary": "Internal",
+  "userRole": "Agent",
+  "username": "pingchili"
+}
+
+### E3) Admin + SuspiciousLogin → server forces Restricted → no ticket, just explanation
+# Expect: next.action="none", no ticketId
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Suspicious login detected on exec account. What are our options?",
+  "issueType": "SuspiciousLogin",
+  "dataBoundary": "Confidential",
+  "userRole": "Admin",
+  "username": "pingchili"
+}

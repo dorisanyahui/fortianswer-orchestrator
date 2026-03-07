@@ -64,6 +64,16 @@ builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
 
 
 builder.Services.AddSingleton<UsersTableService>();
+
+builder.Services.AddSingleton<TicketsTableService>(sp =>
+{
+    var conn = Environment.GetEnvironmentVariable("BLOB_CONNECTION");
+    if (string.IsNullOrWhiteSpace(conn))
+        throw new InvalidOperationException("Missing BLOB_CONNECTION env var (used for TicketsTableService).");
+
+    return new TicketsTableService(conn);
+});
+
 // NOTE: PdfTextExtractor is registered as typed HttpClient above.
 // Do NOT also AddSingleton<PdfTextExtractor>() again, to avoid confusion.
 
