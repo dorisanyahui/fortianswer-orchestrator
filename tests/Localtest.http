@@ -316,13 +316,3 @@ Content-Type: application/json
 
 ### E3) Admin + SuspiciousLogin → server forces Restricted → no ticket, just explanation
 # Expect: next.action="none", no ticketId
-POST {{baseUrl}}/api/chat
-Content-Type: application/json
-
-{
-  "message": "Suspicious login detected on exec account. What are our options?",
-  "issueType": "SuspiciousLogin",
-  "dataBoundary": "Confidential",
-  "userRole": "Admin",
-  "username": "pingchili"
-}

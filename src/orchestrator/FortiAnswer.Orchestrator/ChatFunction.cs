@@ -64,6 +64,7 @@ public sealed class ChatFunction
 
         // We'll try to log at the end no matter what.
         string? conversationId = null;
+        string? username = null;
         string? userRole = null;
         string? requestedBoundary = null;
         string? allowedBoundary = null;
@@ -138,6 +139,8 @@ public sealed class ChatFunction
             {
                 conversationId = "conv-" + requestId[..8];
             }
+
+            username = body?.Username?.Trim().ToLowerInvariant() ?? "anonymous";
 
             // 3) Resolve role + boundary (server-side)
             var headerRole = GetHeader(req, "x-user-role");
@@ -547,6 +550,7 @@ I’ll escalate this request to an authorized responder.
                 await _tables.WriteConversationLogAsync(
                     requestId: reqId,
                     conversationId: convId ?? "",
+                    username: username ?? "anonymous",
                     outcome: outc,
                     role: userRole ?? "Unknown",
                     dataBoundary: boundary ?? "Unknown",

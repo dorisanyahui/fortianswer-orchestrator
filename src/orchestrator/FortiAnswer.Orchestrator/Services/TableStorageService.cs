@@ -20,6 +20,7 @@ public sealed class TableStorageService
     public async Task WriteConversationLogAsync(
         string requestId,
         string conversationId,
+        string username,
         string outcome,
         string role,
         string dataBoundary,
@@ -41,6 +42,7 @@ public sealed class TableStorageService
             ["CreatedAtUtc"] = DateTime.UtcNow.ToString("o"),
             ["RequestId"] = requestId,
             ["ConversationId"] = conversationId,
+            ["Username"] = username,
             ["Outcome"] = outcome,
             ["Role"] = role,
             ["DataBoundary"] = dataBoundary,
@@ -55,6 +57,33 @@ public sealed class TableStorageService
         await table.AddEntityAsync(entity);
 
         _log.LogInformation("ConversationLog written. requestId={RequestId} PK={PK} RK={RK}", requestId, pk, rk);
+    }
+
+    public async Task<List<ConversationLogEntry>> GetConversationsByUsernameAsync(string username)
+    {
+        var table = LogsTable();
+        await table.CreateIfNotExistsAsync();
+
+        var safe = username.Replace("'", "''");
+        var filter = $"Username eq '{safe}'";
+
+        var results = new List<ConversationLogEntry>();
+        await foreach (var e in table.QueryAsync<TableEntity>(filter))
+        {
+            results.Add(new ConversationLogEntry
+            {
+                RequestId      = GetStr(e, "RequestId")      ?? "",
+                ConversationId = GetStr(e, "ConversationId") ?? "",
+                Username       = GetStr(e, "Username")       ?? "",
+                Outcome        = GetStr(e, "Outcome")        ?? "",
+                IssueType      = GetStr(e, "RequestType")    ?? "",
+                TicketId       = GetStr(e, "TicketId"),
+                CreatedAtUtc   = GetStr(e, "CreatedAtUtc")   ?? ""
+            });
+        }
+
+        results.Sort((a, b) => string.Compare(b.CreatedAtUtc, a.CreatedAtUtc, StringComparison.Ordinal));
+        return results;
     }
 
     public async Task<DebugLookupResult?> GetDebugByRequestIdAsync(string requestId)
@@ -91,6 +120,17 @@ public sealed class TableStorageService
 
     private static string? GetStr(TableEntity e, string name)
         => e.TryGetValue(name, out var v) ? v?.ToString() : null;
+
+    public sealed class ConversationLogEntry
+    {
+        public string  RequestId      { get; set; } = "";
+        public string  ConversationId { get; set; } = "";
+        public string  Username       { get; set; } = "";
+        public string  Outcome        { get; set; } = "";
+        public string  IssueType      { get; set; } = "";
+        public string? TicketId       { get; set; }
+        public string  CreatedAtUtc   { get; set; } = "";
+    }
 
     public sealed class DebugLookupResult
     {

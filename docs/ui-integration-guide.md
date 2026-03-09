@@ -1,8 +1,8 @@
 # FortiAnswer — UI Integration Guide
 **For:** Web UI Developer (Li)
-**Last updated:** 2026-03-07
-**Base URL (local):** `http://localhost:7071`
-**Base URL (production):** `https://<YOUR-FUNC>.azurewebsites.net`
+**Last updated:** 2026-03-08
+
+**baseUrl:** = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
 
 ---
 
@@ -14,7 +14,8 @@ The backend exposes four groups of endpoints. As a UI developer, you mainly work
 |---|---|---|
 | Auth | `/api/auth/register`, `/api/auth/login` | User accounts |
 | Chat | `/api/chat` | AI-powered Q&A with escalation |
-| Tickets | `POST /api/tickets`, `GET /api/tickets/{id}` | Escalation tickets |
+| Tickets | `POST /api/tickets`, `GET /api/tickets/{id}`, `GET /api/tickets?username=` | Escalation tickets |
+| Conversations | `GET /api/conversations?username=` | Conversation history per user |
 
 ---
 
@@ -318,7 +319,86 @@ For when the user wants to open a ticket without going through chat.
 
 ---
 
-## 4. Ticket Priority Reference
+### List Tickets by User — `GET /api/tickets?username={username}`
+
+Returns all tickets belonging to the logged-in user, newest first.
+
+**Example:** `GET /api/tickets?username=pingchili`
+
+**Response 200:**
+```json
+[
+  {
+    "ticketId": "a1b2c3d4e5f6",
+    "conversationId": "conv-abc123",
+    "status": "Open",
+    "priority": "P3",
+    "issueType": "VPN",
+    "dataBoundary": "Public",
+    "createdByUser": "pingchili",
+    "assignedTo": null,
+    "summary": "VPN not connecting after password reset",
+    "escalationReason": "Manual ticket created by user.",
+    "source": "manual",
+    "createdUtc": "2026-03-07T03:00:00Z",
+    "updatedUtc": "2026-03-07T03:00:00Z"
+  }
+]
+```
+
+| Status | Meaning |
+|---|---|
+| 200 OK | Returns array (empty array if no tickets) |
+| 400 Bad Request | `username` query param missing |
+
+---
+
+## 4. Conversations — `GET /api/conversations?username={username}`
+
+Returns the logged-in user's conversation history, newest first. Each entry is one chat turn.
+
+**Example:** `GET /api/conversations?username=pingchili`
+
+**Response 200:**
+```json
+[
+  {
+    "requestId": "ccf3fed0b5d545b8ae5993ffab2a952e",
+    "conversationId": "conv-ccf3fed0",
+    "username": "pingchili",
+    "outcome": "answered",
+    "issueType": "VPN",
+    "ticketId": null,
+    "createdAtUtc": "2026-03-08T10:00:00Z"
+  },
+  {
+    "requestId": "abc123...",
+    "conversationId": "conv-abc123",
+    "username": "pingchili",
+    "outcome": "escalated",
+    "issueType": "SuspiciousLogin",
+    "ticketId": "cbc484ec1cd9",
+    "createdAtUtc": "2026-03-08T09:00:00Z"
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `requestId` | Unique ID for this chat turn |
+| `conversationId` | Groups turns from the same session |
+| `outcome` | `answered` \| `escalated` \| `needs_web_confirmation` \| `error` |
+| `issueType` | Issue category for this turn |
+| `ticketId` | Set only when this turn triggered an escalation |
+
+| Status | Meaning |
+|---|---|
+| 200 OK | Returns array (empty array if no history) |
+| 400 Bad Request | `username` query param missing |
+
+---
+
+## 5. Ticket Priority Reference
 
 The server automatically assigns priority based on `issueType`. The UI can use this to colour-code tickets.
 
@@ -331,7 +411,7 @@ The server automatically assigns priority based on `issueType`. The UI can use t
 
 ---
 
-## 5. Escalation Logic — How It Works
+## 6. Escalation Logic — How It Works
 
 This section explains exactly when and why escalation triggers, so you know what to expect in the UI.
 
@@ -580,7 +660,36 @@ Expected: `200 OK`, full ticket object with `status = "Open"`
 
 ---
 
-## 6. Recommended UI Flow
+**Test 6 — List all tickets for a user**
+```http
+GET http://localhost:7071/api/tickets?username=pingchili
+```
+Expected: `200 OK`, array of tickets where every item has `createdByUser = "pingchili"`. Should include the ticket from Test 4 and any auto-escalated tickets from Tests 1 and 3.
+
+---
+
+**Test 7 — List conversation history for a user**
+```http
+GET http://localhost:7071/api/conversations?username=pingchili
+```
+Expected: `200 OK`, array of conversation entries, newest first. Entries from Tests 1–3 should appear. Check that `ticketId` is populated on the entry from Test 1 (escalation) and `null` on Tests 2 and 3.
+
+---
+
+**Test 8 — Missing username returns 400**
+```http
+GET http://localhost:7071/api/tickets
+```
+Expected: `400 Bad Request`, `error.code = "ValidationError"`
+
+```http
+GET http://localhost:7071/api/conversations
+```
+Expected: `400 Bad Request`, `error.code = "ValidationError"`
+
+---
+
+## 7. Recommended UI Flow
 
 ```
 User logs in (POST /api/auth/login)
@@ -612,7 +721,7 @@ User manually opens a ticket (optional)
 
 ---
 
-## 6. Notes for Li
+## 8. Notes for Li
 
 - **No JWT yet.** Auth is username/password only. Store `username` in session after login and pass it in the `username` field of chat/ticket requests. Do not store the password.
 - **`userRole` in chat is a hint.** The server enforces the real boundary. However you should still send the correct role so logs are accurate.

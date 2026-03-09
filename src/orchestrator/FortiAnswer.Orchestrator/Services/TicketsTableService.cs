@@ -51,6 +51,39 @@ public sealed class TicketsTableService
     }
 
     /// <summary>
+    /// Returns all tickets created by the given username, newest first.
+    /// </summary>
+    public async Task<List<TicketEntity>> GetByUsernameAsync(string username)
+    {
+        var safe = username.Replace("'", "''");
+        var filter = $"CreatedByUser eq '{safe}'";
+
+        var results = new List<TicketEntity>();
+        await foreach (var e in _table.QueryAsync<TableEntity>(filter))
+        {
+            results.Add(new TicketEntity
+            {
+                TicketId         = GetStr(e, "TicketId")         ?? e.RowKey,
+                ConversationId   = GetStr(e, "ConversationId"),
+                Status           = GetStr(e, "Status")           ?? "Open",
+                Priority         = GetStr(e, "Priority")         ?? "P4",
+                IssueType        = GetStr(e, "IssueType")        ?? "General",
+                DataBoundary     = GetStr(e, "DataBoundary")     ?? "Public",
+                CreatedByUser    = GetStr(e, "CreatedByUser")    ?? "",
+                AssignedTo       = GetStr(e, "AssignedTo"),
+                Summary          = GetStr(e, "Summary")          ?? "",
+                EscalationReason = GetStr(e, "EscalationReason") ?? "",
+                Source           = GetStr(e, "Source")           ?? "manual",
+                CreatedUtc       = GetStr(e, "CreatedUtc")       ?? "",
+                UpdatedUtc       = GetStr(e, "UpdatedUtc")       ?? ""
+            });
+        }
+
+        results.Sort((a, b) => string.Compare(b.CreatedUtc, a.CreatedUtc, StringComparison.Ordinal));
+        return results;
+    }
+
+    /// <summary>
     /// Returns a ticket by ID, or null if not found.
     /// </summary>
     public async Task<TicketEntity?> GetByIdAsync(string ticketId)
