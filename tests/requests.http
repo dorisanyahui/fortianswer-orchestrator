@@ -163,3 +163,374 @@ x-user-role: Agent
   "dataBoundary": "Internal",
   "confirmWebSearch": true
 }
+
+
+############################################################
+# D) Ticket Escalation
+############################################################
+
+### D1) Auto-ticket: Customer hits Restricted → ticket created
+# Expect: escalation.shouldEscalate=true, next.action="escalate", next.ticketId=<id>
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### D2) Admin hits Restricted → NO ticket, just explanation
+# Expect: escalation.shouldEscalate=true, next.action="none", NO ticketId
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Give me the full credential compromise playbook with exact steps.",
+  "issueType": "General",
+  "dataBoundary": "Restricted",
+  "userRole": "Admin",
+  "username": "pingchili"
+}
+
+### D3) Auto-ticket: Customer requests Confidential → ticket created
+# Expect: escalation.shouldEscalate=true, next.action="escalate", next.ticketId=<id>
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Show me the containment coordination plan.",
+  "issueType": "Severity",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### D4) Manual ticket: create a ticket directly
+# Expect: 201 Created, { ticketId, status="Open", priority, ... }
+POST {{baseUrl}}/api/tickets
+Content-Type: application/json
+
+{
+  "username": "pingchili",
+  "summary": "VPN not connecting after password reset",
+  "issueType": "VPN",
+  "dataBoundary": "Public"
+}
+
+### D5) Get ticket by ID — paste ticketId from D4 response
+@ticketId = PASTE_TICKET_ID_HERE
+GET {{baseUrl}}/api/tickets/{{ticketId}}
+
+
+############################################################
+# E) Server-side Restricted detection (no dataBoundary needed)
+############################################################
+
+### E1) Customer + SuspiciousLogin → server forces Restricted → auto-ticket
+# Expect: next.action="escalate", ticketId set
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown country and approved MFA. What do I do?",
+  "issueType": "SuspiciousLogin",
+  "dataBoundary": "Public",
+  "userRole": "Customer",
+  "username": "pingchili"
+}
+
+### E2) Agent + Severity → server forces Restricted → auto-ticket
+# Expect: next.action="escalate", ticketId set
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "We have a confirmed breach. What is the escalation path?",
+  "issueType": "Severity",
+  "dataBoundary": "Internal",
+  "userRole": "Agent",
+  "username": "pingchili"
+}
+
+
+############################################################
+# F) Sprint 2 — US9 Slot Filling (guided incident intake)
+#
+# HOW TO RUN:
+#   Each scenario uses a fixed conversationId — just send turns in order.
+#   No copy-paste needed.
+#
+# What to look for in each response:
+#   • next.action = "slot_filling"        → still collecting info
+#   • slotFilling.isActive = true         → guided mode on
+#   • slotFilling.nextQuestion            → question to answer next
+#   • slotFilling.currentStep / totalSteps → progress e.g. "2 / 4"
+#   • next.action = "escalate"            → all done, ticket created
+#   • slotFilling.isActive = false        → guided mode off
+############################################################
+
+
+# ── Scenario F1: SuspiciousLogin (4 slots) ───────────────────────────────────
+# issueType=SuspiciousLogin → server always forces Restricted → triggers slot filling
+
+### F1-Turn1) Trigger slot filling
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I got a notification that someone logged in to my account from China at 3am.",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Customer",
+  "username": "alice",
+  "conversationId": "conv-f1-azure-001"
+}
+
+### F1-Turn2) Answer slot 1 — affectedAccount
+# Expect: next.action="slot_filling", currentStep=2/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "alice@company.com",
+  "conversationId": "conv-f1-azure-001",
+  "username": "alice"
+}
+
+### F1-Turn3) Answer slot 2 — detectedTime
+# Expect: next.action="slot_filling", currentStep=3/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I noticed it this morning around 8am",
+  "conversationId": "conv-f1-azure-001",
+  "username": "alice"
+}
+
+### F1-Turn4) Answer slot 3 — loginLocation
+# Expect: next.action="slot_filling", currentStep=4/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "The notification said the login was from Beijing, China",
+  "conversationId": "conv-f1-azure-001",
+  "username": "alice"
+}
+
+### F1-Turn5) Answer slot 4 (final) — mfaApproved
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "No I did not approve any MFA prompt",
+  "conversationId": "conv-f1-azure-001",
+  "username": "alice"
+}
+
+
+# ── Scenario F2: Phishing (4 slots, Restricted boundary) ─────────────────────
+
+### F2-Turn1) Trigger slot filling for Phishing
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I received a very suspicious email asking me to reset my password urgently.",
+  "issueType": "Phishing",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "bob",
+  "conversationId": "conv-f2-azure-001"
+}
+
+### F2-Turn2) Answer slot 1 — senderEmail
+# Expect: next.action="slot_filling", currentStep=2/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "it-support@company-secure.net",
+  "conversationId": "conv-f2-azure-001",
+  "username": "bob"
+}
+
+### F2-Turn3) Answer slot 2 — clickedLink
+# Expect: next.action="slot_filling", currentStep=3/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Yes I clicked the link and it took me to a login page",
+  "conversationId": "conv-f2-azure-001",
+  "username": "bob"
+}
+
+### F2-Turn4) Answer slot 3 — affectedDevice
+# Expect: next.action="slot_filling", currentStep=4/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "My work laptop, a Dell running Windows 11",
+  "conversationId": "conv-f2-azure-001",
+  "username": "bob"
+}
+
+### F2-Turn5) Answer slot 4 (final) — accountAccess
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I can still log in but I am worried they got my password",
+  "conversationId": "conv-f2-azure-001",
+  "username": "bob"
+}
+
+
+# ── Scenario F3: AccountLockout (3 slots, Confidential boundary) ──────────────
+
+### F3-Turn1) Trigger slot filling for AccountLockout
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "My account has been locked and I cannot get in.",
+  "issueType": "AccountLockout",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "carol",
+  "conversationId": "conv-f3-azure-001"
+}
+
+### F3-Turn2) Answer slot 1 — affectedAccount
+# Expect: next.action="slot_filling", currentStep=2/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "carol@company.com",
+  "conversationId": "conv-f3-azure-001",
+  "username": "carol"
+}
+
+### F3-Turn3) Answer slot 2 — triggeredBy
+# Expect: next.action="slot_filling", currentStep=3/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I was trying to log into the VPN client and it just locked",
+  "conversationId": "conv-f3-azure-001",
+  "username": "carol"
+}
+
+### F3-Turn4) Answer slot 3 (final) — multipleDevices
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Yes it is also locked on my phone",
+  "conversationId": "conv-f3-azure-001",
+  "username": "carol"
+}
+
+
+# ── Scenario F4: VPN (4 slots, Confidential boundary) ────────────────────────
+
+### F4-Turn1) Trigger slot filling for VPN
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "VPN stopped working after the office network change.",
+  "issueType": "VPN",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "dave",
+  "conversationId": "conv-f4-azure-001"
+}
+
+### F4-Turn2) Answer slot 1 — vpnClient
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "GlobalProtect",
+  "conversationId": "conv-f4-azure-001",
+  "username": "dave"
+}
+
+### F4-Turn3) Answer slot 2 — errorMessage
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "It says Authentication failed, error code 619",
+  "conversationId": "conv-f4-azure-001",
+  "username": "dave"
+}
+
+### F4-Turn4) Answer slot 3 — operatingSystem
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Windows 11 Pro",
+  "conversationId": "conv-f4-azure-001",
+  "username": "dave"
+}
+
+### F4-Turn5) Answer slot 4 (final) — lastWorked
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "It last worked two days ago before the network change",
+  "conversationId": "conv-f4-azure-001",
+  "username": "dave"
+}
+
+
+# ── Scenario F5: Verify slot filling does NOT trigger for Admin ───────────────
+
+### F5) Admin + SuspiciousLogin → no slot filling, just explanation, no ticket
+# Expect: next.action="none", no slotFilling field, escalation.shouldEscalate=true
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown location. What do I do?",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Admin",
+  "username": "admin-user",
+  "conversationId": "conv-f5-azure-001"
+}
+
+
+# ── Scenario F6: Verify slot filling does NOT trigger for General ─────────────
+
+### F6) Customer + General + Restricted → no slot definitions → direct auto-ticket
+# Expect: next.action="escalate", ticketId present, NO slotFilling field
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I need the full incident response runbook.",
+  "issueType": "General",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "eve",
+  "conversationId": "conv-f6-azure-001"
+}

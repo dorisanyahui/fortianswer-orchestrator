@@ -1,6 +1,6 @@
 # FortiAnswer — UI Integration Guide
 **For:** Web UI Developer (Li)
-**Last updated:** 2026-03-08
+**Last updated:** 2026-03-14
 
 **baseUrl:** = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
 
@@ -180,6 +180,7 @@ This is the key field for driving UI behaviour after a chat response.
 |---|---|---|
 | `"none"` | Normal answer | Display `answer` and `citations` |
 | `"escalate"` | Ticket was auto-created | Display `answer`, show ticket banner with `next.ticketId` |
+| `"slot_filling"` | Bot is collecting incident details | Enter guided mode — show `slotFilling.nextQuestion` as the next prompt |
 | `"suggest_escalate"` | *(future)* AI suggests escalation | Show a soft prompt asking user to confirm |
 
 **Escalation response example:**
@@ -235,7 +236,211 @@ When the internal knowledge base has no relevant results for a Public query, the
 
 ---
 
-## 3. Tickets
+## 3. Slot Filling — Guided Incident Intake (US9)
+
+When the user reports a high-priority issue (Phishing, SuspiciousLogin, VPN, MFA, EndpointAlert, AccountLockout, PasswordReset), the bot collects key details **one question at a time** before creating the ticket. This ensures the ticket contains complete, structured information so the security team can act immediately.
+
+### When Does Slot Filling Trigger?
+
+Slot filling replaces the **immediate auto-ticket** for non-Admin users when escalation is required:
+
+| Trigger | Role | Result |
+|---|---|---|
+| `issueType = "SuspiciousLogin"` or `"Severity"` | Customer / Agent | Slot filling starts |
+| `dataBoundary = "Restricted"` (explicit) | Customer / Agent | Slot filling starts (if issueType has slots) |
+| `dataBoundary = "Confidential"` (non-Admin) | Customer / Agent | Slot filling starts (if issueType has slots) |
+| Any of the above | **Admin** | No slot filling — Admin gets a direct explanation |
+| `issueType = "General"` triggering escalation | Customer / Agent | No slot filling — ticket created immediately (General has no slots) |
+
+> The UI **does not need to decide** when to start slot filling. Just check `next.action` on every response.
+
+---
+
+### Slot Filling Response Fields
+
+When `next.action == "slot_filling"`, the response includes a `slotFilling` object:
+
+```json
+{
+  "requestId": "...",
+  "conversationId": "conv-abc123",
+  "answer": "To help the security team handle your SuspiciousLogin report as quickly as possible, I need to collect a few details first.",
+  "citations": [],
+  "slotFilling": {
+    "isActive": true,
+    "currentStep": 1,
+    "totalSteps": 4,
+    "nextQuestion": "Which account was affected?",
+    "slotKey": "affectedAccount",
+    "hint": "e.g. your email address"
+  },
+  "next": {
+    "action": "slot_filling"
+  },
+  "escalation": {
+    "shouldEscalate": false,
+    "reason": ""
+  }
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `slotFilling.isActive` | bool | `true` while collecting, `false` when done |
+| `slotFilling.currentStep` | int | 1-based step number for the current question |
+| `slotFilling.totalSteps` | int | Total questions for this issueType |
+| `slotFilling.nextQuestion` | string | The question to show the user |
+| `slotFilling.slotKey` | string | Machine-readable field name (for optional validation hints) |
+| `slotFilling.hint` | string | Suggested input placeholder / example |
+
+When all questions are answered, the final response has `isActive = false` and `next.action = "escalate"`:
+
+```json
+{
+  "answer": "Thank you — I've collected all the details needed. A SuspiciousLogin ticket has been created and assigned to the security team.",
+  "slotFilling": {
+    "isActive": false
+  },
+  "next": {
+    "action": "escalate",
+    "ticketId": "a1b2c3d4e5f6"
+  },
+  "escalation": {
+    "shouldEscalate": true,
+    "reason": "Slot filling complete for SuspiciousLogin."
+  }
+}
+```
+
+---
+
+### How to Send Answers
+
+The user's answer is sent as the `message` field in the **next chat request**. No new fields needed — just keep the same `conversationId`.
+
+```json
+POST /api/chat
+{
+  "message": "alice@company.com",
+  "conversationId": "conv-abc123",
+  "username": "alice"
+}
+```
+
+> **Critical:** The `conversationId` must be the same across all turns in a slot filling session. The backend uses it to look up the session state. If `conversationId` changes, the backend will start a new conversation and slot filling will restart.
+
+---
+
+### Number of Questions Per Issue Type
+
+| `issueType` | Questions |
+|---|---|
+| `Phishing` | 4 |
+| `SuspiciousLogin` | 4 |
+| `VPN` | 4 |
+| `MFA` | 4 |
+| `EndpointAlert` | 4 |
+| `AccountLockout` | 3 |
+| `PasswordReset` | 3 |
+| `General` / `Severity` | 0 — no slot filling |
+
+---
+
+### Complete Turn-by-Turn Example (SuspiciousLogin)
+
+**Turn 1 — User reports the issue:**
+```json
+// Request
+{ "message": "Someone logged in from China at 3am.", "issueType": "SuspiciousLogin", "userRole": "Customer", "username": "alice", "conversationId": "conv-abc123" }
+
+// Response
+{ "next": { "action": "slot_filling" }, "slotFilling": { "isActive": true, "currentStep": 1, "totalSteps": 4, "nextQuestion": "Which account was affected?", "hint": "e.g. your email address" } }
+```
+
+**Turn 2 — User answers question 1:**
+```json
+// Request
+{ "message": "alice@company.com", "conversationId": "conv-abc123", "username": "alice" }
+
+// Response
+{ "next": { "action": "slot_filling" }, "slotFilling": { "isActive": true, "currentStep": 2, "totalSteps": 4, "nextQuestion": "When did you first notice this?", "hint": "e.g. 2 pm today" } }
+```
+
+**Turn 3 — User answers question 2:**
+```json
+// Request
+{ "message": "I noticed it this morning around 8am", "conversationId": "conv-abc123", "username": "alice" }
+
+// Response
+{ "next": { "action": "slot_filling" }, "slotFilling": { "isActive": true, "currentStep": 3, "totalSteps": 4, "nextQuestion": "Where was the suspicious login from?", "hint": "e.g. China, unknown location" } }
+```
+
+**Turn 4 — User answers question 3:**
+```json
+// Request
+{ "message": "Beijing, China", "conversationId": "conv-abc123", "username": "alice" }
+
+// Response
+{ "next": { "action": "slot_filling" }, "slotFilling": { "isActive": true, "currentStep": 4, "totalSteps": 4, "nextQuestion": "Was there an MFA prompt — and was it approved?", "hint": "yes / no / didn't receive one" } }
+```
+
+**Turn 5 — User answers question 4 (final):**
+```json
+// Request
+{ "message": "No I did not approve any MFA prompt", "conversationId": "conv-abc123", "username": "alice" }
+
+// Response — slot filling complete, ticket created
+{ "answer": "Thank you — I've collected all the details needed...", "slotFilling": { "isActive": false }, "next": { "action": "escalate", "ticketId": "a1b2c3d4e5f6" }, "escalation": { "shouldEscalate": true } }
+```
+
+---
+
+### UI Implementation Checklist for Slot Filling
+
+**State to track in the UI:**
+
+| Variable | Where to get it | Purpose |
+|---|---|---|
+| `isSlotFilling` | `response.slotFilling?.isActive === true` | Toggle guided mode |
+| `currentStep` | `response.slotFilling.currentStep` | Show progress bar |
+| `totalSteps` | `response.slotFilling.totalSteps` | Show progress bar |
+| `nextQuestion` | `response.slotFilling.nextQuestion` | Display in chat bubble |
+| `inputHint` | `response.slotFilling.hint` | Input placeholder text |
+
+**On receiving `next.action == "slot_filling"`:**
+1. Render `slotFilling.nextQuestion` as a bot message (styled differently from a normal answer — e.g. a light blue background to signal "guided mode")
+2. Show a progress indicator: `Step 1 / 4`
+3. Set the input box placeholder to `slotFilling.hint`
+4. Keep the send button enabled — user types their answer normally
+
+**On sending the user's answer:**
+- Send exactly as a normal chat message: `{ "message": userInput, "conversationId": same_id, "username": ... }`
+- Do **not** re-send `issueType` or `dataBoundary` — the backend reads those from the saved session
+
+**On receiving `next.action == "escalate"` after slot filling:**
+- `slotFilling.isActive` will be `false`
+- Show the ticket confirmation banner with `next.ticketId` (same as a normal escalation)
+- Exit guided mode
+
+**Suggested UI mockup:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Bot  [Step 1 / 4]                                              │
+│  ─────────────────────────────────────────────────────────────  │
+│  To help the security team handle your SuspiciousLogin          │
+│  report, I need a few details.                                  │
+│                                                                 │
+│  Which account was affected?                                    │
+│                                                                 │
+│  [ alice@company.com_________________ ]  [Send]                │
+│    e.g. your email address                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Tickets
 
 ### Create Ticket (Manual) — `POST /api/tickets`
 
@@ -353,7 +558,7 @@ Returns all tickets belonging to the logged-in user, newest first.
 
 ---
 
-## 4. Conversations — `GET /api/conversations?username={username}`
+## 5. Conversations — `GET /api/conversations?username={username}`
 
 Returns the logged-in user's conversation history, newest first. Each entry is one chat turn.
 
@@ -398,7 +603,7 @@ Returns the logged-in user's conversation history, newest first. Each entry is o
 
 ---
 
-## 5. Ticket Priority Reference
+## 6. Ticket Priority Reference
 
 The server automatically assigns priority based on `issueType`. The UI can use this to colour-code tickets.
 
@@ -411,7 +616,7 @@ The server automatically assigns priority based on `issueType`. The UI can use t
 
 ---
 
-## 6. Escalation Logic — How It Works
+## 7. Escalation Logic — How It Works
 
 This section explains exactly when and why escalation triggers, so you know what to expect in the UI.
 
@@ -448,19 +653,25 @@ Is issueType == "SuspiciousLogin" or "Severity"?
   NO  → Use role-based boundary (Customer=Public, Agent=Internal, Admin=Confidential)
         |
         v
-Is boundary == "Restricted"?
-  YES + role is Customer or Agent → Create ticket → return next.action="escalate" + ticketId
-  YES + role is Admin             → No ticket     → return next.action="none" (explain only)
-  NO  → Is Customer/Agent requesting Confidential?
-          YES → Create ticket → return next.action="escalate" + ticketId
-          NO  → Normal AI answer → return next.action="none"
+Is boundary == "Restricted" or Customer/Agent requesting Confidential?
+  NO  → Normal AI answer → next.action="none"
+  YES + role is Admin → No ticket, explain only → next.action="none"
+  YES + role is Customer or Agent
+        |
+        v
+Does issueType have slot definitions? (Phishing/SuspiciousLogin/VPN/MFA/EndpointAlert/AccountLockout/PasswordReset)
+  YES → Start slot filling → next.action="slot_filling"
+        User answers questions one by one (same conversationId each turn)
+        After final answer → Create ticket → next.action="escalate" + ticketId
+  NO  → Create ticket immediately → next.action="escalate" + ticketId
+        (issueType="General" or "Severity" — no slot definitions)
 ```
 
 ---
 
 ### Real Examples with Actual Responses
 
-**Example 1 — Customer asks about Suspicious Login**
+**Example 1 — Customer asks about Suspicious Login (slot filling starts)**
 
 Request:
 ```json
@@ -474,22 +685,36 @@ POST /api/chat
 }
 ```
 
-Response:
+Response (Turn 1 — slot filling begins):
 ```json
 {
-  "answer": "This request falls under Restricted content. I can't provide step-by-step playbook details in chat.\n\nA ticket has been created and will be assigned to an authorized responder.\n\nTo help them act quickly, please provide: who is affected, when it started, and whether MFA was approved or credentials were entered.",
-  "next": {
-    "action": "escalate",
-    "ticketId": "cbc484ec1cd9"
+  "answer": "To help the security team handle your SuspiciousLogin report as quickly as possible, I need to collect a few details first.",
+  "slotFilling": {
+    "isActive": true,
+    "currentStep": 1,
+    "totalSteps": 4,
+    "nextQuestion": "Which account was affected?",
+    "slotKey": "affectedAccount",
+    "hint": "e.g. your email address"
   },
-  "escalation": {
-    "shouldEscalate": true,
-    "reason": "Restricted content requires escalation."
-  }
+  "next": { "action": "slot_filling" },
+  "escalation": { "shouldEscalate": false, "reason": "" }
 }
 ```
 
-**What the UI should show:** Display the `answer` text, then show a ticket banner with `ticketId = cbc484ec1cd9`.
+**What the UI should show:** Enter guided mode. Show `slotFilling.nextQuestion` as the bot's message with a `Step 1 / 4` indicator. The user types their answer and sends it with the same `conversationId`.
+
+After the user answers all 4 questions, the final response will be:
+```json
+{
+  "answer": "Thank you — I've collected all the details needed. A SuspiciousLogin ticket has been created and assigned to the security team.",
+  "slotFilling": { "isActive": false },
+  "next": { "action": "escalate", "ticketId": "cbc484ec1cd9" },
+  "escalation": { "shouldEscalate": true, "reason": "Slot filling complete for SuspiciousLogin." }
+}
+```
+
+**What the UI should show then:** Exit guided mode, show the ticket banner with `ticketId = cbc484ec1cd9`.
 
 ---
 
@@ -689,7 +914,109 @@ Expected: `400 Bad Request`, `error.code = "ValidationError"`
 
 ---
 
-## 7. Recommended UI Flow
+**Test 9 — Slot filling: SuspiciousLogin triggers guided mode (Turn 1)**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from China at 3am and I think they approved MFA.",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Customer",
+  "username": "pingchili",
+  "conversationId": "conv-test-slotfill-01"
+}
+```
+Expected: `next.action = "slot_filling"`, `slotFilling.isActive = true`, `slotFilling.currentStep = 1`, `slotFilling.totalSteps = 4`, `slotFilling.nextQuestion` is about affected account.
+
+---
+
+**Test 10 — Slot filling: answer turn 2 (same conversationId)**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "pingchili@company.com",
+  "conversationId": "conv-test-slotfill-01",
+  "username": "pingchili"
+}
+```
+Expected: `next.action = "slot_filling"`, `slotFilling.currentStep = 2`, `slotFilling.nextQuestion` is about when the login was noticed.
+
+---
+
+**Test 11 — Slot filling: answer turn 3**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "I noticed it this morning around 8am",
+  "conversationId": "conv-test-slotfill-01",
+  "username": "pingchili"
+}
+```
+Expected: `next.action = "slot_filling"`, `slotFilling.currentStep = 3`.
+
+---
+
+**Test 12 — Slot filling: answer turn 4**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "Beijing, China",
+  "conversationId": "conv-test-slotfill-01",
+  "username": "pingchili"
+}
+```
+Expected: `next.action = "slot_filling"`, `slotFilling.currentStep = 4` (last question).
+
+---
+
+**Test 13 — Slot filling: final answer → ticket created**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "No I did not approve any MFA prompt",
+  "conversationId": "conv-test-slotfill-01",
+  "username": "pingchili"
+}
+```
+Expected: `next.action = "escalate"`, `next.ticketId` is set, `slotFilling.isActive = false`, `escalation.shouldEscalate = true`.
+
+---
+
+**Test 14 — Slot filling: verify ticket was created with full details**
+```http
+GET http://localhost:7071/api/tickets/{ticketId from Test 13}
+```
+Expected: `200 OK`, `source = "slot_filling"`, `priority = "P1"`, `summary` contains all 4 collected answers.
+
+---
+
+**Test 15 — Slot filling does NOT trigger for Admin**
+```http
+POST http://localhost:7071/api/chat
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown location.",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Admin",
+  "username": "pingchili",
+  "conversationId": "conv-test-admin-01"
+}
+```
+Expected: `next.action = "none"`, **no** `slotFilling` field, `escalation.shouldEscalate = true`.
+
+---
+
+## 8. Recommended UI Flow
 
 ```
 User logs in (POST /api/auth/login)
@@ -697,9 +1024,10 @@ User logs in (POST /api/auth/login)
 
 User selects issue type from dropdown
   → Map role to dataBoundary (see table above)
+  → Generate a conversationId (UUID) for this session — reuse it for ALL turns
 
 User types message and submits
-  → POST /api/chat with { message, issueType, userRole, username, dataBoundary }
+  → POST /api/chat with { message, issueType, userRole, username, dataBoundary, conversationId }
 
 Check response:
 
@@ -709,6 +1037,15 @@ Check response:
   next.action == "escalate"
     → Display escalation banner with next.ticketId
     → Optionally call GET /api/tickets/{id} to show ticket details
+
+  next.action == "slot_filling"
+    → Enter guided mode:
+        Show slotFilling.nextQuestion as bot message
+        Show progress: "Step N / M"
+        Set input placeholder to slotFilling.hint
+        User types answer → resend with { message: answer, conversationId, username }
+        Repeat until next.action == "escalate"
+    → On final escalate: show ticket banner, exit guided mode
 
   needsWebConfirmation == true
     → Show "Search web?" prompt
@@ -721,9 +1058,11 @@ User manually opens a ticket (optional)
 
 ---
 
-## 8. Notes for Li
+## 9. Notes for Li
 
 - **No JWT yet.** Auth is username/password only. Store `username` in session after login and pass it in the `username` field of chat/ticket requests. Do not store the password.
 - **`userRole` in chat is a hint.** The server enforces the real boundary. However you should still send the correct role so logs are accurate.
-- **`conversationId` for threading.** Generate a UUID on the client at the start of each chat session and reuse it for all messages in that session. This groups messages together in the logs.
+- **`conversationId` is now critical — not optional.** Generate a UUID on the client at the start of each chat session and reuse it for every message in that session. Without a consistent `conversationId`, slot filling will break (the backend cannot find the session state between turns). Use something like `"conv-" + crypto.randomUUID()`.
+- **Slot filling does not require UI state about which slot you're on.** The server tracks that. The UI only needs to check `next.action` and render `slotFilling.nextQuestion`. No hardcoded question lists on the frontend.
+- **`slotFilling` field may be absent.** When the response is a normal answer or a direct escalation (no slot filling), the `slotFilling` key will not be present. Always use optional chaining: `response.slotFilling?.isActive`.
 - **Correlation header.** The server returns `x-correlation-id` in every response header. Log this on the client side — it helps with debugging.

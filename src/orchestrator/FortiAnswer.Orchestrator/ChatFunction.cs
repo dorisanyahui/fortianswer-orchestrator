@@ -23,6 +23,7 @@ public sealed class ChatFunction
     private readonly GroqClient _groq;
     private readonly TableStorageService _tables;
     private readonly TicketsTableService _tickets;
+    private readonly SlotSessionService _slotSessions;
 
     private static readonly JsonSerializerOptions JsonIn = new()
     {
@@ -42,7 +43,8 @@ public sealed class ChatFunction
         PromptBuilder promptBuilder,
         GroqClient groq,
         TableStorageService tables,
-        TicketsTableService tickets)
+        TicketsTableService tickets,
+        SlotSessionService slotSessions)
     {
         _log = loggerFactory.CreateLogger<ChatFunction>();
         _retrieval = retrieval;
@@ -51,6 +53,7 @@ public sealed class ChatFunction
         _groq = groq;
         _tables = tables;
         _tickets = tickets;
+        _slotSessions = slotSessions;
     }
 
     [Function("chat")]
@@ -170,6 +173,103 @@ public sealed class ChatFunction
 
             userGroup = body?.UserGroup;
 
+            // ── SLOT FILLING: resume an active session ────────────────────────────
+            // If this conversationId already has an in-progress slot session the
+            // user's message is their answer to the current slot question.
+            // We handle it here and return early — bypassing retrieval and LLM.
+            var activeSession = await SafeGetSlotSessionAsync(conversationId!);
+            if (activeSession is not null)
+            {
+                // Override outer logging variables from session data.
+                issueType = activeSession.IssueType;
+                userRole  = activeSession.UserRole;
+                boundary  = activeSession.DataBoundary;
+
+                var allSlots    = SlotDefinitions.GetSlots(activeSession.IssueType);
+                var currentSlot = allSlots[activeSession.CurrentSlotIndex];
+
+                // Persist the answer and advance the index (mutates activeSession.CurrentSlotIndex).
+                await _slotSessions.SaveAnswerAndAdvanceAsync(activeSession, currentSlot.Key, message!);
+
+                if (activeSession.CurrentSlotIndex < allSlots.Count)
+                {
+                    // More questions to ask.
+                    outcome = "slot_filling";
+                    var nextSlot = allSlots[activeSession.CurrentSlotIndex];
+                    var slotContinueResp = new
+                    {
+                        requestId,
+                        conversationId,
+                        answer           = nextSlot.Question,
+                        citations        = new List<Citation>(),
+                        needsWebConfirmation = false,
+                        webSearchToken   = (string?)null,
+                        slotFilling      = new
+                        {
+                            isActive      = true,
+                            currentStep   = activeSession.CurrentSlotIndex + 1,
+                            totalSteps    = allSlots.Count,
+                            nextQuestion  = nextSlot.Question,
+                            slotKey       = nextSlot.Key,
+                            hint          = nextSlot.Hint,
+                        },
+                        next       = new { action = "slot_filling" },
+                        escalation = new { shouldEscalate = false, reason = "" },
+                        mode       = new
+                        {
+                            retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                            llm       = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq",
+                        },
+                    };
+                    await SafeWriteLogAsync(requestId, conversationId, outcome);
+                    return await Ok(req, requestId, clientCorrelationId, slotContinueResp);
+                }
+                else
+                {
+                    // All slots collected — build summary, create ticket, complete session.
+                    outcome = "escalated";
+                    var slotSummary  = BuildSlotSummary(activeSession);
+                    var slotTicketId = await SafeCreateTicketAsync(
+                        convId:           conversationId,
+                        createdByUser:    activeSession.Username,
+                        issueType:        activeSession.IssueType,
+                        dataBoundary:     activeSession.DataBoundary,
+                        summary:          slotSummary,
+                        escalationReason: $"Slot filling complete — all details collected for {activeSession.IssueType}.",
+                        source:           "slot_filling");
+
+                    await _slotSessions.CompleteAsync(conversationId!);
+
+                    var slotCompleteResp = new
+                    {
+                        requestId,
+                        conversationId,
+                        answer           = $"Thank you — I've collected all the details needed. " +
+                                           $"A {activeSession.IssueType} ticket has been created and assigned to the security team.",
+                        citations        = new List<Citation>(),
+                        needsWebConfirmation = false,
+                        webSearchToken   = (string?)null,
+                        slotFilling      = new { isActive = false },
+                        next             = slotTicketId is not null
+                                             ? (object)new { action = "escalate", ticketId = slotTicketId }
+                                             : new { action = "none" },
+                        escalation       = new
+                        {
+                            shouldEscalate = true,
+                            reason         = $"Slot filling complete for {activeSession.IssueType}.",
+                        },
+                        mode             = new
+                        {
+                            retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                            llm       = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq",
+                        },
+                    };
+                    await SafeWriteLogAsync(requestId, conversationId, outcome, ticketId: slotTicketId);
+                    return await Ok(req, requestId, clientCorrelationId, slotCompleteResp);
+                }
+            }
+            // ── END SLOT FILLING RESUME ───────────────────────────────────────────
+
             // TopK config for web only
             var webTopK = ReadTopK("WEB_TOPK", 3, 1, 10);
 
@@ -179,8 +279,50 @@ public sealed class ChatFunction
                 outcome = "escalated";
                 usedRetrieval = "none";
 
+                // Non-Admin + issueType has slot definitions → start guided slot filling
+                // before creating the ticket (collect full incident details first).
+                if (!string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase) &&
+                    SlotDefinitions.HasSlots(issueType))
+                {
+                    outcome = "slot_filling";
+                    await _slotSessions.StartAsync(
+                        conversationId!, issueType!, username, userRole!, "Restricted", message!);
+
+                    var restrictedSlots = SlotDefinitions.GetSlots(issueType!);
+                    var restrictedFirst = restrictedSlots[0];
+                    var slotStartResp   = new
+                    {
+                        requestId,
+                        conversationId,
+                        answer           = $"To help the security team handle your {issueType} report as quickly as possible, " +
+                                           $"I need to collect a few details first.",
+                        citations        = new List<Citation>(),
+                        needsWebConfirmation = false,
+                        webSearchToken   = (string?)null,
+                        slotFilling      = new
+                        {
+                            isActive     = true,
+                            currentStep  = 1,
+                            totalSteps   = restrictedSlots.Count,
+                            nextQuestion = restrictedFirst.Question,
+                            slotKey      = restrictedFirst.Key,
+                            hint         = restrictedFirst.Hint,
+                        },
+                        next       = new { action = "slot_filling" },
+                        escalation = new { shouldEscalate = false, reason = "" },
+                        mode       = new
+                        {
+                            retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                            llm       = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq",
+                        },
+                    };
+                    await SafeWriteLogAsync(requestId, conversationId, outcome);
+                    return await Ok(req, requestId, clientCorrelationId, slotStartResp);
+                }
+
+                // Admin -or- issueType has no slot definitions → existing behavior.
                 // Admin: just explain, no ticket.
-                // Customer / Agent: auto-create ticket.
+                // Customer / Agent (no slots): auto-create ticket directly.
                 string? autoTicketId = null;
                 if (!string.Equals(userRole, "Admin", StringComparison.OrdinalIgnoreCase))
                 {
@@ -231,6 +373,46 @@ public sealed class ChatFunction
                 outcome = "escalated";
                 usedRetrieval = "none";
 
+                // Non-Admin + issueType has slot definitions → start guided slot filling.
+                if (SlotDefinitions.HasSlots(issueType))
+                {
+                    outcome = "slot_filling";
+                    await _slotSessions.StartAsync(
+                        conversationId!, issueType!, username, userRole!, "Confidential", message!);
+
+                    var confSlots = SlotDefinitions.GetSlots(issueType!);
+                    var confFirst = confSlots[0];
+                    var confSlotStartResp = new
+                    {
+                        requestId,
+                        conversationId,
+                        answer           = $"This request requires elevated access. To escalate it correctly, " +
+                                           $"I need to gather a few details about your {issueType} issue.",
+                        citations        = new List<Citation>(),
+                        needsWebConfirmation = false,
+                        webSearchToken   = (string?)null,
+                        slotFilling      = new
+                        {
+                            isActive     = true,
+                            currentStep  = 1,
+                            totalSteps   = confSlots.Count,
+                            nextQuestion = confFirst.Question,
+                            slotKey      = confFirst.Key,
+                            hint         = confFirst.Hint,
+                        },
+                        next       = new { action = "slot_filling" },
+                        escalation = new { shouldEscalate = false, reason = "" },
+                        mode       = new
+                        {
+                            retrieval = Environment.GetEnvironmentVariable("RETRIEVAL_MODE") ?? "stub",
+                            llm       = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GROQ_API_KEY")) ? "stub" : "groq",
+                        },
+                    };
+                    await SafeWriteLogAsync(requestId, conversationId, outcome);
+                    return await Ok(req, requestId, clientCorrelationId, confSlotStartResp);
+                }
+
+                // No slot definitions for this issueType → existing behavior.
                 // Customer / Agent requesting Confidential → auto-create ticket.
                 var autoTicketId = await SafeCreateTicketAsync(
                     convId:           conversationId,
@@ -465,6 +647,38 @@ I’ll escalate this request to an authorized responder.
         {
             swTotal.Stop();
         }
+
+        // ── Slot filling helpers (local functions) ────────────────────────────
+
+        async Task<SlotSession?> SafeGetSlotSessionAsync(string convId)
+        {
+            try { return await _slotSessions.GetActiveAsync(convId); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to read slot session. requestId={requestId}", requestId);
+                return null;
+            }
+        }
+
+        static string BuildSlotSummary(SlotSession session)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"[{session.IssueType} — incident details collected via guided intake]");
+
+            var slots = SlotDefinitions.GetSlots(session.IssueType);
+            foreach (var slot in slots)
+            {
+                if (session.CollectedSlots.TryGetValue(slot.Key, out var answer))
+                    sb.AppendLine($"- {slot.Question.TrimEnd('?', ' ')}: {answer}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(session.OriginalMessage))
+                sb.AppendLine($"\nOriginal message: \"{session.OriginalMessage}\"");
+
+            return sb.ToString().Trim();
+        }
+
+        // ── Existing helpers ──────────────────────────────────────────────────
 
         async Task<string?> SafeCreateTicketAsync(
             string? convId,

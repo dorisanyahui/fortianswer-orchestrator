@@ -316,3 +316,245 @@ Content-Type: application/json
 
 ### E3) Admin + SuspiciousLogin → server forces Restricted → no ticket, just explanation
 # Expect: next.action="none", no ticketId
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown country and approved MFA. What do I do?",
+  "issueType": "SuspiciousLogin",
+  "dataBoundary": "Public",
+  "userRole": "Admin",
+  "username": "pingchili"
+}
+
+
+############################################################
+# F) Sprint 2 — US9 Slot Filling (guided incident intake)
+#
+# HOW TO RUN:
+#   1. Send the first request (F1/F2/F3).
+#   2. Copy the "conversationId" value from the response body.
+#   3. Paste it into the @convId variable directly below each scenario.
+#   4. Send each follow-up turn in order (answer each question).
+#   5. After the last slot, you should get next.action="escalate" + ticketId.
+#
+# What to look for in each response:
+#   • next.action = "slot_filling"        → still collecting info
+#   • slotFilling.isActive = true         → guided mode on
+#   • slotFilling.nextQuestion            → question to answer next
+#   • slotFilling.currentStep / totalSteps → progress e.g. "2 / 4"
+#   • next.action = "escalate"            → all done, ticket created
+#   • slotFilling.isActive = false        → guided mode off
+############################################################
+
+
+# ── Scenario F1: SuspiciousLogin (4 slots) ───────────────────────────────────
+# issueType=SuspiciousLogin → server always forces Restricted → triggers slot filling
+
+@convF1 = PASTE_conversationId_FROM_F1_TURN1_RESPONSE_HERE
+
+### F1-Turn1) Trigger slot filling (first message)
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+# → Copy conversationId from response and set @convF1 above
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I got a notification that someone logged in to my account from China at 3am.",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Customer",
+  "username": "alice",
+  "conversationId": "conv-f1-demo-001"
+}
+
+### F1-Turn2) Answer slot 1 — affectedAccount
+# Expect: next.action="slot_filling", currentStep=2/4
+# nextQuestion will ask about "when did you first notice"
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "alice@company.com",
+  "conversationId": "conv-f1-demo-001",
+  "username": "alice"
+}
+
+### F1-Turn3) Answer slot 2 — detectedTime
+# Expect: next.action="slot_filling", currentStep=3/4
+# nextQuestion will ask about login location
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I noticed it this morning around 8am",
+  "conversationId": "conv-f1-demo-001",
+  "username": "alice"
+}
+
+### F1-Turn4) Answer slot 3 — loginLocation
+# Expect: next.action="slot_filling", currentStep=4/4
+# nextQuestion will ask about MFA
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "The notification said the login was from Beijing, China",
+  "conversationId": "conv-f1-demo-001",
+  "username": "alice"
+}
+
+### F1-Turn5) Answer slot 4 (final) — mfaApproved
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+# A ticket is created with full collected details as the summary
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "No I did not approve any MFA prompt",
+  "conversationId": "conv-f1-demo-001",
+  "username": "alice"
+}
+
+
+# ── Scenario F2: Phishing (4 slots, Restricted boundary) ─────────────────────
+
+### F2-Turn1) Trigger slot filling for Phishing
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I received a very suspicious email asking me to reset my password urgently.",
+  "issueType": "Phishing",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "bob",
+  "conversationId": "conv-f2-demo-001"
+}
+
+### F2-Turn2) Answer slot 1 — senderEmail
+# Expect: next.action="slot_filling", currentStep=2/4
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "it-support@company-secure.net",
+  "conversationId": "conv-f2-demo-001",
+  "username": "bob"
+}
+
+### F2-Turn3) Answer slot 2 — clickedLink
+# Expect: next.action="slot_filling", currentStep=3/4
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Yes I clicked the link and it took me to a login page",
+  "conversationId": "conv-f2-demo-001",
+  "username": "bob"
+}
+
+### F2-Turn4) Answer slot 3 — affectedDevice
+# Expect: next.action="slot_filling", currentStep=4/4
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "My work laptop, a Dell running Windows 11",
+  "conversationId": "conv-f2-demo-001",
+  "username": "bob"
+}
+
+### F2-Turn5) Answer slot 4 (final) — accountAccess
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I can still log in but I am worried they got my password",
+  "conversationId": "conv-f2-demo-001",
+  "username": "bob"
+}
+
+
+# ── Scenario F3: AccountLockout (3 slots, Confidential boundary) ──────────────
+
+### F3-Turn1) Trigger slot filling for AccountLockout
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/3
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "My account has been locked and I cannot get in.",
+  "issueType": "AccountLockout",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "carol",
+  "conversationId": "conv-f3-demo-001"
+}
+
+### F3-Turn2) Answer slot 1 — affectedAccount
+# Expect: next.action="slot_filling", currentStep=2/3
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "carol@company.com",
+  "conversationId": "conv-f3-demo-001",
+  "username": "carol"
+}
+
+### F3-Turn3) Answer slot 2 — triggeredBy
+# Expect: next.action="slot_filling", currentStep=3/3
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I was trying to log into the VPN client and it just locked",
+  "conversationId": "conv-f3-demo-001",
+  "username": "carol"
+}
+
+### F3-Turn4) Answer slot 3 (final) — multipleDevices
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Yes it is also locked on my phone",
+  "conversationId": "conv-f3-demo-001",
+  "username": "carol"
+}
+
+
+# ── Scenario F4: Verify slot filling does NOT trigger for Admin ───────────────
+
+### F4) Admin + SuspiciousLogin → no slot filling, just explanation, no ticket
+# Expect: next.action="none", slotFilling field absent, escalation.shouldEscalate=true
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "Someone logged in from an unknown location. What do I do?",
+  "issueType": "SuspiciousLogin",
+  "userRole": "Admin",
+  "username": "admin-user",
+  "conversationId": "conv-f4-demo-001"
+}
+
+
+# ── Scenario F5: Verify slot filling does NOT trigger for General ─────────────
+
+### F5) Customer + General + Restricted → no slot definitions → direct auto-ticket
+# Expect: next.action="escalate", ticketId present, NO slotFilling field
+POST {{baseUrl}}/api/chat
+Content-Type: application/json
+
+{
+  "message": "I need the full incident response runbook.",
+  "issueType": "General",
+  "dataBoundary": "Restricted",
+  "userRole": "Customer",
+  "username": "dave",
+  "conversationId": "conv-f5-demo-001"
+}
