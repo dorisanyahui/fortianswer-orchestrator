@@ -229,8 +229,8 @@ GET {{baseUrl}}/api/tickets/{{ticketId}}
 # E) Server-side Restricted detection (no dataBoundary needed)
 ############################################################
 
-### E1) Customer + SuspiciousLogin → server forces Restricted → auto-ticket
-# Expect: next.action="escalate", ticketId set
+### E1) Customer + SuspiciousLogin → server forces Restricted → slot filling (has slot definitions)
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
 POST {{chatUrl}}
 Content-Type: application/json
 
@@ -242,7 +242,7 @@ Content-Type: application/json
   "username": "pingchili"
 }
 
-### E2) Agent + Severity → server forces Restricted → auto-ticket
+### E2) Agent + Severity → server forces Restricted → auto-ticket (Severity has no slot definitions)
 # Expect: next.action="escalate", ticketId set
 POST {{chatUrl}}
 Content-Type: application/json
@@ -533,4 +533,176 @@ Content-Type: application/json
   "userRole": "Customer",
   "username": "eve",
   "conversationId": "conv-f6-azure-001"
+}
+
+
+# ── Scenario F7: MFA (4 slots, Confidential boundary) ────────────────────────
+
+### F7-Turn1) Trigger slot filling for MFA
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "My MFA stopped working and I can't log in to anything.",
+  "issueType": "MFA",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "frank",
+  "conversationId": "conv-f7-azure-001"
+}
+
+### F7-Turn2) Answer slot 1 — mfaMethod
+# Expect: next.action="slot_filling", currentStep=2/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I use the Microsoft Authenticator app",
+  "conversationId": "conv-f7-azure-001",
+  "username": "frank"
+}
+
+### F7-Turn3) Answer slot 2 — deviceType
+# Expect: next.action="slot_filling", currentStep=3/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I am trying to log in on my Windows 11 laptop",
+  "conversationId": "conv-f7-azure-001",
+  "username": "frank"
+}
+
+### F7-Turn4) Answer slot 3 — errorDetail
+# Expect: next.action="slot_filling", currentStep=4/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "The push notification never arrives on my phone",
+  "conversationId": "conv-f7-azure-001",
+  "username": "frank"
+}
+
+### F7-Turn5) Answer slot 4 (final) — lastWorked
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "It worked fine yesterday morning",
+  "conversationId": "conv-f7-azure-001",
+  "username": "frank"
+}
+
+
+# ── Scenario F8: EndpointAlert (4 slots, Confidential boundary) ───────────────
+
+### F8-Turn1) Trigger slot filling for EndpointAlert
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "My laptop just showed a malware detected alert and I don't know what to do.",
+  "issueType": "EndpointAlert",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "grace",
+  "conversationId": "conv-f8-azure-001"
+}
+
+### F8-Turn2) Answer slot 1 — alertType
+# Expect: next.action="slot_filling", currentStep=2/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "Malware detected — it said Trojan:Win32/AgentTesla",
+  "conversationId": "conv-f8-azure-001",
+  "username": "grace"
+}
+
+### F8-Turn3) Answer slot 2 — deviceName
+# Expect: next.action="slot_filling", currentStep=3/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "LAPTOP-GRACE02",
+  "conversationId": "conv-f8-azure-001",
+  "username": "grace"
+}
+
+### F8-Turn4) Answer slot 3 — affectedUser
+# Expect: next.action="slot_filling", currentStep=4/4
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "It is my own device",
+  "conversationId": "conv-f8-azure-001",
+  "username": "grace"
+}
+
+### F8-Turn5) Answer slot 4 (final) — actionsTaken
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I disconnected from the network and haven't touched it since",
+  "conversationId": "conv-f8-azure-001",
+  "username": "grace"
+}
+
+
+# ── Scenario F9: PasswordReset (3 slots, Confidential boundary) ───────────────
+
+### F9-Turn1) Trigger slot filling for PasswordReset
+# Expect: next.action="slot_filling", slotFilling.isActive=true, currentStep=1/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I need to reset my password but the self-service portal is not working.",
+  "issueType": "PasswordReset",
+  "dataBoundary": "Confidential",
+  "userRole": "Customer",
+  "username": "henry",
+  "conversationId": "conv-f9-azure-001"
+}
+
+### F9-Turn2) Answer slot 1 — affectedAccount
+# Expect: next.action="slot_filling", currentStep=2/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "henry@company.com",
+  "conversationId": "conv-f9-azure-001",
+  "username": "henry"
+}
+
+### F9-Turn3) Answer slot 2 — methodTried
+# Expect: next.action="slot_filling", currentStep=3/3
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "I tried the self-service portal and also the email reset link",
+  "conversationId": "conv-f9-azure-001",
+  "username": "henry"
+}
+
+### F9-Turn4) Answer slot 3 (final) — errorDetail
+# Expect: next.action="escalate", slotFilling.isActive=false, ticketId present
+POST {{chatUrl}}
+Content-Type: application/json
+
+{
+  "message": "The portal gives a 500 error and the email link says it has expired",
+  "conversationId": "conv-f9-azure-001",
+  "username": "henry"
 }
