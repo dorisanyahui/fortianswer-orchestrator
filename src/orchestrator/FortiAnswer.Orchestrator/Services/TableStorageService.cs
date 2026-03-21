@@ -29,7 +29,9 @@ public sealed class TableStorageService
         double? topScore,
         string? ticketId,
         long? latencyMs,
-        object? debugObj)
+        object? debugObj,
+        string? userMessage  = null,
+        string? botAnswer    = null)
     {
         var table = LogsTable();
         await table.CreateIfNotExistsAsync();
@@ -39,24 +41,65 @@ public sealed class TableStorageService
 
         var entity = new TableEntity(pk, rk)
         {
-            ["CreatedAtUtc"] = DateTime.UtcNow.ToString("o"),
-            ["RequestId"] = requestId,
+            ["CreatedAtUtc"]   = DateTime.UtcNow.ToString("o"),
+            ["RequestId"]      = requestId,
             ["ConversationId"] = conversationId,
-            ["Username"] = username,
-            ["Outcome"] = outcome,
-            ["Role"] = role,
-            ["DataBoundary"] = dataBoundary,
-            ["RequestType"] = requestType,
-            ["UsedRetrieval"] = usedRetrieval,
-            ["TopScore"] = topScore is null ? null : topScore.Value.ToString("0.####"),
-            ["TicketId"] = ticketId,
-            ["LatencyMs"] = latencyMs is null ? null : latencyMs.Value.ToString(),
-            ["DebugJson"] = debugObj is null ? null : JsonSerializer.Serialize(debugObj)
+            ["Username"]       = username,
+            ["Outcome"]        = outcome,
+            ["Role"]           = role,
+            ["DataBoundary"]   = dataBoundary,
+            ["RequestType"]    = requestType,
+            ["UsedRetrieval"]  = usedRetrieval,
+            ["TopScore"]       = topScore is null ? null : topScore.Value.ToString("0.####"),
+            ["TicketId"]       = ticketId,
+            ["LatencyMs"]      = latencyMs is null ? null : latencyMs.Value.ToString(),
+            ["DebugJson"]      = debugObj is null ? null : JsonSerializer.Serialize(debugObj),
+            ["UserMessage"]    = userMessage ?? "",
+            ["BotAnswer"]      = botAnswer   ?? ""
         };
 
         await table.AddEntityAsync(entity);
 
         _log.LogInformation("ConversationLog written. requestId={RequestId} PK={PK} RK={RK}", requestId, pk, rk);
+    }
+
+    /// <summary>
+    /// Returns the last N turns of a conversation, oldest first.
+    /// Used to inject history into the LLM prompt.
+    /// </summary>
+    public async Task<List<ConversationTurn>> GetRecentTurnsAsync(
+        string conversationId,
+        int maxTurns = 5)
+    {
+        var table = LogsTable();
+        await table.CreateIfNotExistsAsync();
+
+        var safe    = conversationId.Replace("'", "''");
+        var filter  = $"ConversationId eq '{safe}'";
+        var results = new List<ConversationTurn>();
+
+        await foreach (var e in table.QueryAsync<TableEntity>(filter))
+        {
+            var userMsg = GetStr(e, "UserMessage");
+            var botAns  = GetStr(e, "BotAnswer");
+
+            // Only include turns that have actual message content
+            if (string.IsNullOrWhiteSpace(userMsg) || string.IsNullOrWhiteSpace(botAns))
+                continue;
+
+            results.Add(new ConversationTurn
+            {
+                UserMessage  = userMsg,
+                BotAnswer    = botAns,
+                CreatedAtUtc = GetStr(e, "CreatedAtUtc") ?? ""
+            });
+        }
+
+        // Sort oldest first, then take last N turns
+        results.Sort((a, b) => string.Compare(a.CreatedAtUtc, b.CreatedAtUtc, StringComparison.Ordinal));
+        return results.Count > maxTurns
+            ? results.GetRange(results.Count - maxTurns, maxTurns)
+            : results;
     }
 
     public async Task<List<ConversationLogEntry>> GetConversationsByUsernameAsync(string username)
@@ -130,6 +173,13 @@ public sealed class TableStorageService
         public string  IssueType      { get; set; } = "";
         public string? TicketId       { get; set; }
         public string  CreatedAtUtc   { get; set; } = "";
+    }
+
+    public sealed class ConversationTurn
+    {
+        public string UserMessage  { get; set; } = "";
+        public string BotAnswer    { get; set; } = "";
+        public string CreatedAtUtc { get; set; } = "";
     }
 
     public sealed class DebugLookupResult

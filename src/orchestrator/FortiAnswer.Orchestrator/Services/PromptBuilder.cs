@@ -2,7 +2,7 @@ namespace FortiAnswer.Orchestrator.Services;
 
 public sealed class PromptBuilder
 {
-    // Wrapper to match ChatFunction.cs call-site
+    // Legacy single-turn wrapper — kept for any callers that still use the old signature.
     public string BuildPrompt(
         string userMessage,
         string requestType,
@@ -21,10 +21,21 @@ public sealed class PromptBuilder
         string? conversationId,
         string internalContext,
         string? webContext)
-    {
-        // NOTE: ChatFunction currently passes the effective boundary (Public/Internal/Confidential/Restricted)
-        // in the requestType field.
+        => BuildSystemPrompt(requestType, userRole, userGroup, conversationId, internalContext, webContext)
+           + $"\n\n=== USER QUESTION ===\n{userMessage}";
 
+    /// <summary>
+    /// Returns only the system portion of the prompt (rules + evidence, no user question).
+    /// Use this with ChatWithHistoryAsync for multi-turn conversations.
+    /// </summary>
+    public string BuildSystemPrompt(
+        string requestType,
+        string userRole,
+        string? userGroup,
+        string? conversationId,
+        string internalContext,
+        string? webContext)
+    {
         return $"""
 You are FortiAnswer, an enterprise support assistant.
 
@@ -36,6 +47,7 @@ You are FortiAnswer, an enterprise support assistant.
 5) Do NOT claim actions were performed (e.g., "I escalated" / "after escalation" / "we have escalated").
    You MAY mention escalation only as a conditional next step ("If confirmed, escalate to Tier-2") AND only if supported by evidence.
 6) Keep the answer concise and actionable.
+7) You have access to the recent conversation history. Use it to understand context and follow-up questions.
 
 === USER METADATA ===
 - boundary: {requestType}
@@ -48,9 +60,6 @@ You are FortiAnswer, an enterprise support assistant.
 
 === WEB EVIDENCE (OPTIONAL) ===
 {(string.IsNullOrWhiteSpace(webContext) ? "[none]" : webContext)}
-
-=== USER QUESTION ===
-{userMessage}
 """;
     }
 }

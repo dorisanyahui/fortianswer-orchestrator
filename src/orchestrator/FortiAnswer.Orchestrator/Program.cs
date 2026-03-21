@@ -1,3 +1,4 @@
+using FortiAnswer.Orchestrator.Middleware;
 using FortiAnswer.Orchestrator.Services;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.DependencyInjection;
@@ -6,6 +7,8 @@ using Microsoft.Extensions.Hosting;
 var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.ConfigureFunctionsWebApplication();
+
+builder.UseMiddleware<ApiKeyMiddleware>();
 
 // ------------------------------------------------------------
 // Base services
@@ -82,6 +85,15 @@ builder.Services.AddSingleton<SlotSessionService>(sp =>
 
     var log = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<SlotSessionService>>();
     return new SlotSessionService(conn, log);
+});
+
+builder.Services.AddSingleton<FeedbackTableService>(sp =>
+{
+    var conn = Environment.GetEnvironmentVariable("BLOB_CONNECTION");
+    if (string.IsNullOrWhiteSpace(conn))
+        throw new InvalidOperationException("Missing BLOB_CONNECTION env var (used for FeedbackTableService).");
+
+    return new FeedbackTableService(conn);
 });
 
 // NOTE: PdfTextExtractor is registered as typed HttpClient above.

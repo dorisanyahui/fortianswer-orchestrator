@@ -8,5 +8,11 @@
             },
             "enableLiveMetricsFilters": true
         }
+    },
+    "extensions": {
+        "http": {
+            "maxConcurrentRequests": 10,
+            "maxOutstandingRequests": 20
+        }
     }
 }

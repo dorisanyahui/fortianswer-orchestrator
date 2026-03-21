@@ -51,6 +51,64 @@ public sealed class TicketsTableService
     }
 
     /// <summary>
+    /// Returns all tickets across all users, with optional client-side filters. Newest first.
+    /// Intended for Agent / Admin callers only — enforce role check in the Function layer.
+    /// </summary>
+    public async Task<List<TicketEntity>> GetAllAsync(
+        string? status       = null,
+        string? priority     = null,
+        string? issueType    = null,
+        string? assignedTo   = null,
+        string? dataBoundary = null)
+    {
+        // All tickets share PartitionKey "ticket" — fetch the whole partition and filter in memory.
+        var results = new List<TicketEntity>();
+        await foreach (var e in _table.QueryAsync<TableEntity>("PartitionKey eq 'ticket'"))
+        {
+            results.Add(MapEntity(e));
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+            results = results.Where(t => string.Equals(t.Status, status, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (!string.IsNullOrWhiteSpace(priority))
+            results = results.Where(t => string.Equals(t.Priority, priority, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (!string.IsNullOrWhiteSpace(issueType))
+            results = results.Where(t => string.Equals(t.IssueType, issueType, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (!string.IsNullOrWhiteSpace(assignedTo))
+            results = results.Where(t => string.Equals(t.AssignedTo, assignedTo, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (!string.IsNullOrWhiteSpace(dataBoundary))
+            results = results.Where(t => string.Equals(t.DataBoundary, dataBoundary, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        results.Sort((a, b) => string.Compare(b.CreatedUtc, a.CreatedUtc, StringComparison.Ordinal));
+        return results;
+    }
+
+    /// <summary>
+    /// Updates mutable fields on an existing ticket.
+    /// Only non-null values in the request are applied.
+    /// Returns false if the ticket does not exist.
+    /// </summary>
+    public async Task<bool> UpdateAsync(string ticketId, TicketUpdateRequest update)
+    {
+        var res = await _table.GetEntityIfExistsAsync<TableEntity>("ticket", ticketId);
+        if (!res.HasValue || res.Value is null) return false;
+
+        var e = res.Value;
+
+        if (update.Status is not null)
+            e["Status"] = update.Status;
+        if (update.AssignedTo is not null)
+            e["AssignedTo"] = update.AssignedTo;
+        if (update.Priority is not null)
+            e["Priority"] = update.Priority;
+
+        e["UpdatedUtc"] = DateTimeOffset.UtcNow.ToString("o");
+
+        await _table.UpdateEntityAsync(e, e.ETag, TableUpdateMode.Replace);
+        return true;
+    }
+
+    /// <summary>
     /// Returns all tickets created by the given username, newest first.
     /// </summary>
     public async Task<List<TicketEntity>> GetByUsernameAsync(string username)
@@ -60,24 +118,7 @@ public sealed class TicketsTableService
 
         var results = new List<TicketEntity>();
         await foreach (var e in _table.QueryAsync<TableEntity>(filter))
-        {
-            results.Add(new TicketEntity
-            {
-                TicketId         = GetStr(e, "TicketId")         ?? e.RowKey,
-                ConversationId   = GetStr(e, "ConversationId"),
-                Status           = GetStr(e, "Status")           ?? "Open",
-                Priority         = GetStr(e, "Priority")         ?? "P4",
-                IssueType        = GetStr(e, "IssueType")        ?? "General",
-                DataBoundary     = GetStr(e, "DataBoundary")     ?? "Public",
-                CreatedByUser    = GetStr(e, "CreatedByUser")    ?? "",
-                AssignedTo       = GetStr(e, "AssignedTo"),
-                Summary          = GetStr(e, "Summary")          ?? "",
-                EscalationReason = GetStr(e, "EscalationReason") ?? "",
-                Source           = GetStr(e, "Source")           ?? "manual",
-                CreatedUtc       = GetStr(e, "CreatedUtc")       ?? "",
-                UpdatedUtc       = GetStr(e, "UpdatedUtc")       ?? ""
-            });
-        }
+            results.Add(MapEntity(e));
 
         results.Sort((a, b) => string.Compare(b.CreatedUtc, a.CreatedUtc, StringComparison.Ordinal));
         return results;
@@ -90,24 +131,38 @@ public sealed class TicketsTableService
     {
         var res = await _table.GetEntityIfExistsAsync<TableEntity>("ticket", ticketId);
         if (!res.HasValue || res.Value is null) return null;
+        return MapEntity(res.Value, ticketId);
+    }
 
-        var e = res.Value;
-        return new TicketEntity
+    private static TicketEntity MapEntity(TableEntity e, string? idOverride = null) => new()
+    {
+        TicketId         = idOverride ?? GetStr(e, "TicketId") ?? e.RowKey,
+        ConversationId   = GetStr(e, "ConversationId"),
+        Status           = GetStr(e, "Status")           ?? "Open",
+        Priority         = GetStr(e, "Priority")         ?? "P4",
+        IssueType        = GetStr(e, "IssueType")        ?? "General",
+        DataBoundary     = GetStr(e, "DataBoundary")     ?? "Public",
+        CreatedByUser    = GetStr(e, "CreatedByUser")    ?? "",
+        AssignedTo       = GetStr(e, "AssignedTo"),
+        Summary          = GetStr(e, "Summary")          ?? "",
+        EscalationReason = GetStr(e, "EscalationReason") ?? "",
+        Source           = GetStr(e, "Source")           ?? "manual",
+        CreatedUtc       = GetStr(e, "CreatedUtc")       ?? "",
+        UpdatedUtc       = GetStr(e, "UpdatedUtc")       ?? ""
+    };
+
+    /// <summary>
+    /// Lightweight connectivity check — tries to read a single entity.
+    /// Returns true if Table Storage is reachable, false on any error.
+    /// </summary>
+    public async Task<bool> PingAsync(CancellationToken ct = default)
+    {
+        try
         {
-            TicketId          = ticketId,
-            ConversationId    = GetStr(e, "ConversationId"),
-            Status            = GetStr(e, "Status")           ?? "Open",
-            Priority          = GetStr(e, "Priority")         ?? "P4",
-            IssueType         = GetStr(e, "IssueType")        ?? "General",
-            DataBoundary      = GetStr(e, "DataBoundary")     ?? "Public",
-            CreatedByUser     = GetStr(e, "CreatedByUser")    ?? "",
-            AssignedTo        = GetStr(e, "AssignedTo"),
-            Summary           = GetStr(e, "Summary")          ?? "",
-            EscalationReason  = GetStr(e, "EscalationReason") ?? "",
-            Source            = GetStr(e, "Source")           ?? "manual",
-            CreatedUtc        = GetStr(e, "CreatedUtc")       ?? "",
-            UpdatedUtc        = GetStr(e, "UpdatedUtc")       ?? ""
-        };
+            await _table.GetEntityIfExistsAsync<TableEntity>("ticket", "__ping__", cancellationToken: ct);
+            return true;
+        }
+        catch { return false; }
     }
 
     /// <summary>
@@ -133,7 +188,7 @@ public sealed class TicketEntity
 {
     public string  TicketId         { get; set; } = "";
     public string? ConversationId   { get; set; }
-    public string  Status           { get; set; } = "Open";
+    public string  Status           { get; set; } = "Open";   // Open | InProgress | Closed
     public string  Priority         { get; set; } = "P4";
     public string  IssueType        { get; set; } = "General";
     public string  DataBoundary     { get; set; } = "Public";
@@ -144,4 +199,19 @@ public sealed class TicketEntity
     public string  Source           { get; set; } = "manual";
     public string  CreatedUtc       { get; set; } = "";
     public string  UpdatedUtc       { get; set; } = "";
+}
+
+/// <summary>
+/// Payload for PATCH /api/tickets/{id}. All fields are optional — only non-null values are applied.
+/// </summary>
+public sealed class TicketUpdateRequest
+{
+    /// <summary>Open | InProgress | Closed</summary>
+    public string? Status     { get; set; }
+
+    /// <summary>Username of the agent taking ownership.</summary>
+    public string? AssignedTo { get; set; }
+
+    /// <summary>P1 | P2 | P3 | P4 — allow manual override.</summary>
+    public string? Priority   { get; set; }
 }

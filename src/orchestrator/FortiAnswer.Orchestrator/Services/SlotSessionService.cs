@@ -145,6 +145,44 @@ public sealed class SlotSessionService
     public async Task CompleteAsync(string conversationId)
         => await SetStatusAsync(conversationId, "complete");
 
+    // ── Maintenance ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Deletes all non-active sessions (complete / expired) and any "active" sessions
+    /// whose UpdatedUtc is older than <paramref name="olderThan"/> (default 2 hours).
+    /// Returns the number of rows deleted.
+    /// </summary>
+    public async Task<int> CleanupExpiredAsync(TimeSpan? olderThan = null, CancellationToken ct = default)
+    {
+        var cutoff = DateTimeOffset.UtcNow - (olderThan ?? TimeSpan.FromHours(2));
+        var toDelete = new List<TableEntity>();
+
+        await foreach (var e in _table.QueryAsync<TableEntity>("PartitionKey eq 'slot'", cancellationToken: ct))
+        {
+            var status    = GetStr(e, "Status") ?? "";
+            var updatedStr = GetStr(e, "UpdatedUtc") ?? "";
+
+            var isStaleActive = status == "active"
+                && DateTimeOffset.TryParse(updatedStr, out var updated)
+                && updated < cutoff;
+
+            if (status != "active" || isStaleActive)
+                toDelete.Add(e);
+        }
+
+        foreach (var e in toDelete)
+        {
+            try { await _table.DeleteEntityAsync(e.PartitionKey, e.RowKey, e.ETag, ct); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to delete slot session rowKey={RowKey}", e.RowKey);
+            }
+        }
+
+        _log.LogInformation("SlotSession cleanup: deleted {Count} stale sessions", toDelete.Count);
+        return toDelete.Count;
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private async Task SetStatusAsync(string conversationId, string status)

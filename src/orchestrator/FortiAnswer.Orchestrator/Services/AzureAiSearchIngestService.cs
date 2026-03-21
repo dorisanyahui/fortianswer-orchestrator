@@ -25,6 +25,25 @@ public sealed class AzureAiSearchIngestService
         _adminKey = cfg["SEARCH_ADMIN_KEY"] ?? throw new InvalidOperationException("SEARCH_ADMIN_KEY missing");
     }
 
+    /// <summary>
+    /// Lightweight connectivity check — issues a search with top=0.
+    /// Returns true if Azure AI Search is reachable, false on any error.
+    /// </summary>
+    public async Task<bool> PingAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var url  = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
+            var body = new { search = "*", top = 0 };
+            using var req = new HttpRequestMessage(HttpMethod.Post, url);
+            req.Headers.Add("api-key", _adminKey);
+            req.Content = new StringContent(JsonSerializer.Serialize(body), System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req, ct);
+            return res.IsSuccessStatusCode;
+        }
+        catch { return false; }
+    }
+
     public async Task UploadAsync(IEnumerable<object> actions, CancellationToken ct)
     {
         var url = $"{_endpoint}/indexes/{_index}/docs/index?api-version={_apiVersion}";
@@ -101,6 +120,94 @@ public sealed class AzureAiSearchIngestService
         return ids;
     }
 
+    /// <summary>
+    /// Returns a list of distinct documents currently indexed in Azure AI Search.
+    /// Uses facets to count chunks per document, then fetches one chunk per document
+    /// to retrieve classification and createdUtc.
+    /// </summary>
+    public async Task<List<KbDocument>> ListDocumentsAsync(CancellationToken ct = default)
+    {
+        // Step 1: Use facets to get distinct paths + chunk counts
+        var facetUrl = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
+        var facetBody = new { search = "*", top = 0, facets = new[] { "path,count:1000" } };
+
+        using var facetReq = new HttpRequestMessage(HttpMethod.Post, facetUrl);
+        facetReq.Headers.Add("api-key", _adminKey);
+        facetReq.Content = new StringContent(
+            JsonSerializer.Serialize(facetBody), Encoding.UTF8, "application/json");
+
+        using var facetRes = await _http.SendAsync(facetReq, ct);
+        var facetText = await facetRes.Content.ReadAsStringAsync(ct);
+        if (!facetRes.IsSuccessStatusCode)
+            throw new InvalidOperationException($"KB list (facets) failed: {(int)facetRes.StatusCode} {facetText}");
+
+        // Parse facet results: [{ "value": "public/faq.docx", "count": 12 }, ...]
+        var chunkCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        using (var facetDoc = JsonDocument.Parse(facetText))
+        {
+            if (facetDoc.RootElement.TryGetProperty("@search.facets", out var facets) &&
+                facets.TryGetProperty("path", out var pathFacets) &&
+                pathFacets.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var f in pathFacets.EnumerateArray())
+                {
+                    var pathVal  = f.TryGetProperty("value", out var v) ? v.GetString() : null;
+                    var count    = f.TryGetProperty("count", out var c) ? c.GetInt32() : 0;
+                    if (!string.IsNullOrWhiteSpace(pathVal))
+                        chunkCounts[pathVal] = count;
+                }
+            }
+        }
+
+        if (chunkCounts.Count == 0) return [];
+
+        // Step 2: Fetch one chunk per path to get classification + createdUtc
+        var detailUrl = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
+        var detailBody = new
+        {
+            search = "*",
+            top    = 1000,
+            select = $"{PATH_FIELD},source,classification,createdUtc"
+        };
+
+        using var detailReq = new HttpRequestMessage(HttpMethod.Post, detailUrl);
+        detailReq.Headers.Add("api-key", _adminKey);
+        detailReq.Content = new StringContent(
+            JsonSerializer.Serialize(detailBody), Encoding.UTF8, "application/json");
+
+        using var detailRes = await _http.SendAsync(detailReq, ct);
+        var detailText = await detailRes.Content.ReadAsStringAsync(ct);
+        if (!detailRes.IsSuccessStatusCode)
+            throw new InvalidOperationException($"KB list (details) failed: {(int)detailRes.StatusCode} {detailText}");
+
+        // Deduplicate — keep first occurrence per path
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var docs  = new List<KbDocument>();
+
+        using var detailDoc = JsonDocument.Parse(detailText);
+        if (detailDoc.RootElement.TryGetProperty("value", out var items) &&
+            items.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in items.EnumerateArray())
+            {
+                var path = item.TryGetProperty(PATH_FIELD, out var p) ? p.GetString() : null;
+                if (string.IsNullOrWhiteSpace(path) || !seen.Add(path)) continue;
+
+                docs.Add(new KbDocument
+                {
+                    Path           = path,
+                    Source         = item.TryGetProperty("source",         out var src)  ? src.GetString()  ?? "" : "",
+                    Classification = item.TryGetProperty("classification", out var cls)  ? cls.GetString()  ?? "" : "",
+                    CreatedUtc     = item.TryGetProperty("createdUtc",     out var crt)  ? crt.GetString()  ?? "" : "",
+                    ChunkCount     = chunkCounts.TryGetValue(path, out var cnt) ? cnt : 0
+                });
+            }
+        }
+
+        docs.Sort((a, b) => string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase));
+        return docs;
+    }
+
     private async Task<int> DeleteDocsByIdsAsync(IEnumerable<string> ids, CancellationToken ct)
     {
         var list = ids.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
@@ -127,4 +234,13 @@ public sealed class AzureAiSearchIngestService
 
         return deleted;
     }
+}
+
+public sealed class KbDocument
+{
+    public string Path           { get; set; } = "";
+    public string Source         { get; set; } = "";
+    public string Classification { get; set; } = "";   // public | internal | confidential | restricted
+    public string CreatedUtc     { get; set; } = "";
+    public int    ChunkCount     { get; set; }
 }

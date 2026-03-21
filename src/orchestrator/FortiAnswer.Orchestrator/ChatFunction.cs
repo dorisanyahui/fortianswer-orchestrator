@@ -77,6 +77,8 @@ public sealed class ChatFunction
 
         string outcome = "unknown";
         string usedRetrieval = "none";
+        string currentMessage = "";
+        string botAnswerText  = "";
         double? bestScore = null;
         double? minScore = null;
         bool noEvidence = false;
@@ -200,7 +202,7 @@ public sealed class ChatFunction
                     {
                         requestId,
                         conversationId,
-                        answer           = nextSlot.Question,
+                        answer           = "",
                         citations        = new List<Citation>(),
                         needsWebConfirmation = false,
                         webSearchToken   = (string?)null,
@@ -569,15 +571,18 @@ I’ll escalate this request to an authorized responder.
                 webUsed = true;
             }
 
-            // 8) Build prompt
-            var basePrompt = _promptBuilder.Build(
-                userMessage: message!,
-                requestType: boundary,
-                userRole: userRole,
-                userGroup: userGroup,
-                conversationId: conversationId,
+            // 8) Build prompt + load conversation history
+            currentMessage = message!;
+
+            var recentTurns = await _tables.GetRecentTurnsAsync(conversationId!, maxTurns: 5);
+
+            var systemPrompt = _promptBuilder.BuildSystemPrompt(
+                requestType:     boundary,
+                userRole:        userRole,
+                userGroup:       userGroup,
+                conversationId:  conversationId,
                 internalContext: internalContext,
-                webContext: webContext
+                webContext:      webContext
             );
 
             var escalationHint =
@@ -603,10 +608,16 @@ I’ll escalate this request to an authorized responder.
                 "5) Prefer concise, actionable mitigations.\n" +
                 "=== END RULES ===\n";
 
-            var prompt = basePrompt + escalationHint + issueHint + guardrails;
+            systemPrompt += escalationHint + issueHint + guardrails;
 
-            // 9) Groq generate
-            var answerText = await _groq.GenerateAsync(prompt, requestId) ?? "";
+            // 9) Groq generate — with conversation history
+            var answerText = await _groq.ChatWithHistoryAsync(
+                systemPrompt:  systemPrompt,
+                history:       recentTurns,
+                userMessage:   message!,
+                correlationId: requestId) ?? "";
+
+            botAnswerText = answerText;
 
             // 10) Response (NO DEBUG returned)
             outcome = "answered";
@@ -762,18 +773,20 @@ I’ll escalate this request to an authorized responder.
                 };
 
                 await _tables.WriteConversationLogAsync(
-                    requestId: reqId,
+                    requestId:     reqId,
                     conversationId: convId ?? "",
-                    username: username ?? "anonymous",
-                    outcome: outc,
-                    role: userRole ?? "Unknown",
-                    dataBoundary: boundary ?? "Unknown",
-                    requestType: issueType ?? "General",
+                    username:      username ?? "anonymous",
+                    outcome:       outc,
+                    role:          userRole ?? "Unknown",
+                    dataBoundary:  boundary ?? "Unknown",
+                    requestType:   issueType ?? "General",
                     usedRetrieval: usedRetrieval,
-                    topScore: bestScore,
-                    ticketId: ticketId,
-                    latencyMs: latencyMs,
-                    debugObj: debugObj
+                    topScore:      bestScore,
+                    ticketId:      ticketId,
+                    latencyMs:     latencyMs,
+                    debugObj:      debugObj,
+                    userMessage:   currentMessage,
+                    botAnswer:     botAnswerText
                 );
             }
             catch (Exception logEx)

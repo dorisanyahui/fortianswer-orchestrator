@@ -1,6 +1,6 @@
 # FortiAnswer — UI Integration Guide
 **For:** Web UI Developer (Li)
-**Last updated:** 2026-03-14
+**Last updated:** 2026-03-21 (Sprint 3)
 
 **baseUrl:** = https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net
 
@@ -14,8 +14,12 @@ The backend exposes four groups of endpoints. As a UI developer, you mainly work
 |---|---|---|
 | Auth | `/api/auth/register`, `/api/auth/login` | User accounts |
 | Chat | `/api/chat` | AI-powered Q&A with escalation |
-| Tickets | `POST /api/tickets`, `GET /api/tickets/{id}`, `GET /api/tickets?username=` | Escalation tickets |
+| Tickets (Customer) | `POST /api/tickets`, `GET /api/tickets/{id}`, `GET /api/tickets?username=` | Self-service ticket creation and lookup |
+| Tickets (Agent/Admin) | `GET /api/admin/tickets`, `PATCH /api/tickets/{id}` | Full ticket overview and management |
 | Conversations | `GET /api/conversations?username=` | Conversation history per user |
+| Feedback | `POST /api/feedback`, `GET /api/feedback/summary`, `GET /api/feedback/flagged`, `PATCH /api/feedback/{id}/dismiss` | Thumbs up / down rating; Admin analytics |
+| Admin KB Upload | `POST /api/admin/documents` | Admin uploads a document to the knowledge base |
+| Health | `GET /api/health` | Dependency health check (Table Storage + Search + Groq) |
 
 ---
 
@@ -515,6 +519,7 @@ For when the user wants to open a ticket without going through chat.
 |---|---|
 | `"manual"` | User created via `POST /api/tickets` |
 | `"auto"` | System created from a chat escalation |
+| `"slot_filling"` | System created after slot filling completion |
 
 **Responses:**
 | Status | Meaning |
@@ -558,7 +563,265 @@ Returns all tickets belonging to the logged-in user, newest first.
 
 ---
 
-## 5. Conversations — `GET /api/conversations?username={username}`
+### Admin/Agent Ticket Overview — `GET /api/admin/tickets`
+
+For Agent and Admin dashboards. Returns **all tickets** across all users, newest first.
+
+**Query params:**
+
+| Param | Required | Notes |
+|---|---|---|
+| `role` | **Yes** | Must be `"agent"` or `"admin"` |
+| `status` | No | Filter by `Open` / `InProgress` / `Closed` |
+| `priority` | No | Filter by `P1` / `P2` / `P3` / `P4` |
+| `issueType` | No | Filter by issue type e.g. `Phishing` |
+| `assignedTo` | No | Filter by assigned agent username |
+| `page` | No | Page number, default `1` |
+| `pageSize` | No | Records per page, default `20`, max `100` |
+
+**Examples:**
+```
+GET /api/admin/tickets?role=agent
+GET /api/admin/tickets?role=admin&status=Open&priority=P1
+GET /api/admin/tickets?role=agent&assignedTo=john
+GET /api/admin/tickets?role=admin&page=2&pageSize=20
+```
+
+**Response 200:**
+```json
+{
+  "total": 50,
+  "page": 1,
+  "pageSize": 20,
+  "totalPages": 3,
+  "tickets": [
+    {
+      "ticketId": "a1b2c3d4e5f6",
+      "conversationId": "conv-abc123",
+      "status": "Open",
+      "priority": "P1",
+      "issueType": "Phishing",
+      "dataBoundary": "Public",
+      "createdByUser": "alice",
+      "assignedTo": null,
+      "summary": "Suspicious email received with malicious link",
+      "escalationReason": "Slot filling complete for Phishing.",
+      "source": "slot_filling",
+      "createdUtc": "2026-03-21T10:00:00Z",
+      "updatedUtc": "2026-03-21T10:00:00Z"
+    },
+    {
+      "ticketId": "b2c3d4e5f6a1",
+      "conversationId": null,
+      "status": "InProgress",
+      "priority": "P3",
+      "issueType": "VPN",
+      "dataBoundary": "Public",
+      "createdByUser": "bob",
+      "assignedTo": "agent-john",
+      "summary": "VPN not connecting after password reset",
+      "escalationReason": "Manual ticket created by user.",
+      "source": "manual",
+      "createdUtc": "2026-03-20T08:30:00Z",
+      "updatedUtc": "2026-03-21T09:15:00Z"
+    }
+  ]
+}
+```
+
+**Responses:**
+| Status | Meaning |
+|---|---|
+| 200 OK | Returns `{ total, page, pageSize, totalPages, tickets[] }` |
+| 403 Forbidden | `role` param missing or not `agent` / `admin` |
+
+---
+
+### Update Ticket — `PATCH /api/tickets/{id}`
+
+For Agent and Admin use. Updates ticket status, assignment, or priority. Only fields included in the request body are changed.
+
+**Query params:**
+
+| Param | Required | Notes |
+|---|---|---|
+| `role` | **Yes** | Must be `"agent"` or `"admin"` |
+
+**Request body** (all fields optional — omit any field you don't want to change):
+```json
+{
+  "status": "InProgress",
+  "assignedTo": "agent-john",
+  "priority": "P2"
+}
+```
+
+| Field | Allowed values | Notes |
+|---|---|---|
+| `status` | `"Open"` / `"InProgress"` / `"Closed"` | Ticket lifecycle state |
+| `assignedTo` | Any username string | Agent taking ownership |
+| `priority` | `"P1"` / `"P2"` / `"P3"` / `"P4"` | Manual priority override |
+
+**Common use cases:**
+
+```json
+// Agent picks up a ticket
+PATCH /api/tickets/a1b2c3d4e5f6?role=agent
+{ "assignedTo": "agent-john", "status": "InProgress" }
+
+// Agent resolves a ticket
+PATCH /api/tickets/a1b2c3d4e5f6?role=agent
+{ "status": "Closed" }
+
+// Admin escalates priority
+PATCH /api/tickets/a1b2c3d4e5f6?role=admin
+{ "priority": "P1" }
+```
+
+**Response 200** — returns the full updated ticket:
+```json
+{
+  "ticketId": "a1b2c3d4e5f6",
+  "status": "InProgress",
+  "priority": "P1",
+  "issueType": "Phishing",
+  "dataBoundary": "Public",
+  "createdByUser": "alice",
+  "assignedTo": "agent-john",
+  "summary": "Suspicious email received with malicious link",
+  "escalationReason": "Slot filling complete for Phishing.",
+  "source": "slot_filling",
+  "createdUtc": "2026-03-21T10:00:00Z",
+  "updatedUtc": "2026-03-21T11:05:00Z"
+}
+```
+
+**Responses:**
+| Status | Meaning |
+|---|---|
+| 200 OK | Update applied; returns updated ticket |
+| 400 Bad Request | Invalid `status` or `priority` value |
+| 403 Forbidden | `role` param missing or not `agent` / `admin` |
+| 404 Not Found | No ticket with that ID |
+
+---
+
+### Ticket Status Reference
+
+| Status | Meaning | Who sets it |
+|---|---|---|
+| `Open` | Newly created, not yet picked up | Server (on creation) |
+| `InProgress` | Agent has taken ownership | Agent / Admin via PATCH |
+| `Closed` | Resolved | Agent / Admin via PATCH |
+
+---
+
+## 5. Feedback
+
+### Submit Rating — `POST /api/feedback`
+
+Lets the user rate any chat answer with a thumbs up or thumbs down. 👎 ratings are automatically flagged for admin review.
+
+**Request body:**
+```json
+{
+  "requestId": "ccf3fed0b5d545b8ae5993ffab2a952e",
+  "username":  "alice",
+  "rating":    "up",
+  "issueType": "VPN",
+  "citations": ["public/faq-vpn.docx", "public/vpn-setup-guide.pdf"]
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `requestId` | Yes | From the chat response `requestId` field |
+| `username` | Yes | Logged-in username |
+| `rating` | Yes | `"up"` or `"down"` |
+| `issueType` | No | From the chat request — pass it through for analytics |
+| `citations` | No | Array of `urlOrId` values from `response.citations` — pass them through for document quality tracking |
+
+> If the user changes their rating, call again with the same `requestId` — it overwrites.
+
+**Response 201:** `{ "recorded": true }`
+
+**Suggested UI:**
+```
+[ Bot answer text... ]
+Was this helpful?  👍  👎
+```
+Show the selected button highlighted after click. Fire and forget — no confirmation needed.
+
+---
+
+### Feedback Summary — `GET /api/feedback/summary?role=admin`
+
+For the Admin dashboard. Returns overall satisfaction + per-issueType + per-document breakdown.
+
+**Response 200:**
+```json
+{
+  "totalUp": 84,
+  "totalDown": 16,
+  "totalRatings": 100,
+  "satisfactionRate": 84.0,
+  "byIssueType": [
+    { "issueType": "VPN",      "up": 20, "down": 10, "satisfactionRate": 66.7 },
+    { "issueType": "Phishing", "up": 40, "down": 2,  "satisfactionRate": 95.2 }
+  ],
+  "byCitation": [
+    { "documentId": "public/faq-vpn.docx",  "fileName": "faq-vpn.docx",  "up": 15, "down": 8, "totalRatings": 23, "satisfactionRate": 65.2 },
+    { "documentId": "public/phishing.pdf",  "fileName": "phishing.pdf",  "up": 38, "down": 1, "totalRatings": 39, "satisfactionRate": 97.4 }
+  ]
+}
+```
+
+> Both `byIssueType` and `byCitation` are sorted **worst first** — so the Admin sees the problems that need fixing at the top.
+
+---
+
+### Flagged Responses — `GET /api/feedback/flagged?role=admin`
+
+Returns all 👎 responses that have not yet been reviewed by an admin.
+
+**Response 200:**
+```json
+{
+  "total": 3,
+  "items": [
+    {
+      "requestId":  "abc123",
+      "username":   "alice",
+      "issueType":  "VPN",
+      "citations":  ["public/faq-vpn.docx"],
+      "createdUtc": "2026-03-21T10:00:00Z"
+    }
+  ]
+}
+```
+
+Admin workflow: see a flagged item → look up `requestId` in conversation logs to read the actual Q&A → fix the KB document → dismiss the flag.
+
+---
+
+### Dismiss Flag — `PATCH /api/feedback/{requestId}/dismiss?role=admin`
+
+Marks a flagged response as reviewed. Call this after the admin has investigated and fixed the issue.
+
+**Response 200:** `{ "dismissed": true }`
+
+**Responses across all feedback endpoints:**
+| Status | Meaning |
+|---|---|
+| 201 Created | Rating recorded |
+| 200 OK | Query / dismiss successful |
+| 400 Bad Request | Missing or invalid field |
+| 403 Forbidden | `role` missing or not `agent`/`admin` |
+| 404 Not Found | RequestId not found (dismiss only) |
+
+---
+
+## 6. Conversations — `GET /api/conversations?username={username}`
 
 Returns the logged-in user's conversation history, newest first. Each entry is one chat turn.
 
@@ -603,20 +866,175 @@ Returns the logged-in user's conversation history, newest first. Each entry is o
 
 ---
 
-## 6. Ticket Priority Reference
+## 7. Knowledge Base Documents — `GET /api/kb/documents`
 
-The server automatically assigns priority based on `issueType`. The UI can use this to colour-code tickets.
+For Admin and Agent dashboards. Lists all documents currently indexed in the knowledge base.
 
-| Priority | Colour suggestion | IssueTypes |
+**Query params:**
+
+| Param | Required | Notes |
 |---|---|---|
-| P1 Critical | Red | `Phishing`, `SuspiciousLogin`, `Severity` |
-| P2 High | Orange | `EndpointAlert`, `AccountLockout` |
-| P3 Medium | Yellow | `VPN`, `MFA`, `PasswordReset` |
-| P4 Low | Grey | `General` |
+| `role` | Yes | `"agent"` or `"admin"` |
+| `classification` | No | Filter by `public` / `internal` / `confidential` / `restricted` |
+
+**Examples:**
+```
+GET /api/kb/documents?role=admin
+GET /api/kb/documents?role=admin&classification=internal
+```
+
+**Response 200:**
+```json
+{
+  "total": 3,
+  "documents": [
+    {
+      "path":           "internal/vpn-setup-guide.docx",
+      "source":         "vpn-setup-guide.docx",
+      "classification": "internal",
+      "createdUtc":     "2026-03-10T08:00:00Z",
+      "chunkCount":     14
+    },
+    {
+      "path":           "public/faq-phishing.pdf",
+      "source":         "faq-phishing.pdf",
+      "classification": "public",
+      "createdUtc":     "2026-03-01T12:00:00Z",
+      "chunkCount":     8
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `path` | Full path in blob storage (e.g. `public/faq.docx`) |
+| `source` | Filename only |
+| `classification` | Data boundary of this document |
+| `createdUtc` | When the document was indexed |
+| `chunkCount` | How many chunks the document was split into |
+
+**Responses:**
+| Status | Meaning |
+|---|---|
+| 200 OK | Returns `{ total, documents[] }` |
+| 403 Forbidden | `role` missing or not `agent`/`admin` |
+| 500 Internal Server Error | Azure Search unreachable |
 
 ---
 
-## 7. Escalation Logic — How It Works
+## 8. Admin Document Upload — `POST /api/admin/documents`
+
+Allows Admins to upload knowledge base documents directly via API. The uploaded file is stored in blob storage and **ingested automatically** — no separate ingest step needed.
+
+**Query params:**
+
+| Param | Required | Notes |
+|---|---|---|
+| `role` | Yes | Must be `"admin"` |
+| `filename` | Yes | e.g. `vpn-guide.docx`. Must end in `.pdf`, `.docx`, `.txt`, or `.md` |
+| `classification` | No | `public` / `internal` / `confidential` / `restricted` (default: `public`) |
+
+**Request:**
+```http
+POST /api/admin/documents?role=admin&classification=internal&filename=vpn-guide.docx
+Content-Type: application/octet-stream
+x-api-key: <your-key>
+
+[binary file content]
+```
+
+**JS example:**
+```js
+async function uploadDocument(file, classification = "public") {
+  const res = await apiFetch(
+    `/api/admin/documents?role=admin&classification=${classification}&filename=${encodeURIComponent(file.name)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,   // File object from <input type="file">
+    }
+  );
+  return res.json();
+}
+```
+
+**Response 201:**
+```json
+{
+  "blobPath": "internal/vpn-guide.docx",
+  "filename": "vpn-guide.docx",
+  "classification": "internal",
+  "message": "Upload successful. Ingestion will begin shortly."
+}
+```
+
+**Responses:**
+| Status | Meaning |
+|---|---|
+| 201 Created | File uploaded; ingestion starting |
+| 400 Bad Request | Missing filename or unsupported file type |
+| 403 Forbidden | `role` is not `admin` |
+| 500 Internal Server Error | Blob storage upload failed |
+
+---
+
+## 9. Health Check — `GET /api/health`
+
+Returns the health status of the backend and its dependencies. Useful for monitoring or a status page.
+
+**Response 200 (all healthy):**
+```json
+{
+  "status": "ok",
+  "checks": {
+    "tableStorage": "ok",
+    "search": "ok",
+    "groq": "ok"
+  },
+  "timestamp": "2026-03-21T10:00:00Z"
+}
+```
+
+**Response 200 (degraded):**
+```json
+{
+  "status": "degraded",
+  "checks": {
+    "tableStorage": "ok",
+    "search": "fail",
+    "groq": "ok"
+  },
+  "timestamp": "2026-03-21T10:00:00Z"
+}
+```
+
+> The endpoint always returns HTTP 200. Check `status` field — `"ok"` means all healthy, `"degraded"` means at least one check failed.
+
+| Check | Passes when |
+|---|---|
+| `tableStorage` | Table Storage is reachable |
+| `search` | Azure AI Search index is reachable |
+| `groq` | `GROQ_API_KEY` env var is configured |
+
+---
+
+## 10. Ticket Priority Reference
+
+The server automatically assigns priority based on `issueType`. The UI can use this to colour-code tickets.
+
+| Priority | Colour suggestion | CSS hint | IssueTypes |
+|---|---|---|---|
+| P1 Critical | Red | `#DC2626` | `Phishing`, `SuspiciousLogin`, `Severity` |
+| P2 High | Orange | `#EA580C` | `EndpointAlert`, `AccountLockout` |
+| P3 Medium | Yellow | `#CA8A04` | `VPN`, `MFA`, `PasswordReset` |
+| P4 Low | Grey | `#6B7280` | `General` |
+
+> **For Li (Sprint 3):** Display `priority` as a colour badge on every ticket card and in the ticket detail view. The `priority` field is returned in all ticket responses — read it directly, no calculation needed.
+
+---
+
+## 11. Escalation Logic — How It Works
 
 This section explains exactly when and why escalation triggers, so you know what to expect in the UI.
 
@@ -1016,7 +1434,7 @@ Expected: `next.action = "none"`, **no** `slotFilling` field, `escalation.should
 
 ---
 
-## 8. Recommended UI Flow
+## 12. Recommended UI Flow
 
 ```
 User logs in (POST /api/auth/login)
@@ -1058,7 +1476,7 @@ User manually opens a ticket (optional)
 
 ---
 
-## 9. Notes for Li
+## 13. Notes for Li
 
 - **No JWT yet.** Auth is username/password only. Store `username` in session after login and pass it in the `username` field of chat/ticket requests. Do not store the password.
 - **`userRole` in chat is a hint.** The server enforces the real boundary. However you should still send the correct role so logs are accurate.
