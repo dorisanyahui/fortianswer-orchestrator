@@ -37,7 +37,7 @@ public sealed class TicketAdminListFunction
 
     [Function("TicketAdmin_List")]
     public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "admin/tickets")] HttpRequestData req)
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "tickets/all")] HttpRequestData req)
     {
         var qs   = HttpUtility.ParseQueryString(req.Url.Query);
         var role = qs["role"]?.Trim().ToLowerInvariant();

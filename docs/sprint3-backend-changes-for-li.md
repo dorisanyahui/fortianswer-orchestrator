@@ -72,7 +72,7 @@ HTTP 401
 ## 1. 新增：Agent/Admin Ticket 总览
 
 ### 改了什么
-新增 `GET /api/admin/tickets` endpoint。
+新增 `GET /api/tickets/all` endpoint。
 
 ### 为什么改
 原来 `GET /api/tickets?username=` 只能查自己的 ticket，Agent 和 Admin 没有办法看到所有人的 ticket。这个是 Sprint 3 的 Agent Dashboard 功能。
@@ -80,8 +80,8 @@ HTTP 401
 ### 接口
 
 ```
-GET /api/admin/tickets?role=agent
-GET /api/admin/tickets?role=admin
+GET /api/tickets/all?role=agent
+GET /api/tickets/all?role=admin
 ```
 
 **可选 filter 参数（任意组合）：**
@@ -355,7 +355,7 @@ if (response.status === 429) {
 ## 7. ⚠️ 变更：Ticket 列表接口加了分页
 
 ### 改了什么
-`GET /api/admin/tickets` 的 response 结构更新了，**新增了四个字段**：
+`GET /api/tickets/all` 的 response 结构更新了，**新增了四个字段**：
 
 | 字段 | 说明 |
 |------|------|
@@ -373,13 +373,13 @@ if (response.status === 429) {
 **分页请求示例：**
 ```js
 // 第一页（默认）
-GET /api/admin/tickets?role=agent
+GET /api/tickets/all?role=agent
 
 // 第二页，每页 20 条
-GET /api/admin/tickets?role=agent&page=2&pageSize=20
+GET /api/tickets/all?role=agent&page=2&pageSize=20
 
 // 带筛选条件的第三页
-GET /api/admin/tickets?role=admin&status=Open&page=3&pageSize=20
+GET /api/tickets/all?role=admin&status=Open&page=3&pageSize=20
 ```
 
 ---
@@ -387,12 +387,12 @@ GET /api/admin/tickets?role=admin&status=Open&page=3&pageSize=20
 ## 8. 新增：Admin 上传知识库文档
 
 ### 改了什么
-新增 `POST /api/admin/documents` endpoint。Admin 可以直接通过 API 上传文档，后端自动处理 ingestion，不需要手动去 Azure Portal。
+新增 `POST /api/documents/upload` endpoint。Admin 可以直接通过 API 上传文档，后端自动处理 ingestion，不需要手动去 Azure Portal。
 
 ### 接口
 
 ```
-POST /api/admin/documents?role=admin&classification=internal&filename=vpn-guide.docx
+POST /api/documents/upload?role=admin&classification=internal&filename=vpn-guide.docx
 Content-Type: application/octet-stream
 x-api-key: ...
 
@@ -419,7 +419,7 @@ x-api-key: ...
 ```js
 async function uploadDocument(file, classification = "public") {
   const res = await apiFetch(
-    `/api/admin/documents?role=admin&classification=${classification}&filename=${encodeURIComponent(file.name)}`,
+    `/api/documents/upload?role=admin&classification=${classification}&filename=${encodeURIComponent(file.name)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
@@ -487,14 +487,14 @@ async function uploadDocument(file, classification = "public") {
 |------|---------|-------|
 | 所有请求加 `x-api-key` header | API Key | 🔴 **必须先做，否则全部 401** |
 | Priority 颜色 badge（P1红/P2橙/P3黄/P4灰） | 已有数据，只加样式 | 🔴 高 |
-| Agent ticket dashboard 列表页（含分页） | `GET /api/admin/tickets` | 🔴 高 |
+| Agent ticket dashboard 列表页（含分页） | `GET /api/tickets/all` | 🔴 高 |
 | ⚠️ 更新已有 ticket 列表代码以兼容新 response 结构 | 分页字段变更 | 🔴 如果已经做了必须改 |
 | Ticket 详情页加 Assign + 状态操作 | `PATCH /api/tickets/{id}` | 🟡 中 |
 | 支持 `InProgress` 状态显示 | status 新增值 | 🟡 中 |
 | 每条回答加 👍 👎 按钮（带 issueType + citations） | `POST /api/feedback` | 🟡 中 |
 | Admin dashboard 加满意率卡片（用 `fileName` 显示文档名） | `GET /api/feedback/summary` | 🟡 中 |
 | Admin dashboard 加待审核列表 | `GET /api/feedback/flagged` + dismiss | 🟡 中 |
-| Admin KB 文档页加上传功能 | `POST /api/admin/documents` | 🟡 中 |
+| Admin KB 文档页加上传功能 | `POST /api/documents/upload` | 🟡 中 |
 | 加 429 错误处理 | 限流 | 🟢 低 |
 | Admin 面板状态指示灯（可选） | `GET /api/health` | 🟢 低 |
 

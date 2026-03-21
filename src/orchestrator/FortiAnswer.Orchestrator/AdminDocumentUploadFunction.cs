@@ -4,13 +4,12 @@ using System.Web;
 using Azure.Storage.Blobs;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace FortiAnswer.Orchestrator.Functions;
 
 /// <summary>
-/// POST /api/admin/documents — upload a document to the knowledge base blob container.
+/// POST /api/documents/upload — upload a document to the knowledge base blob container.
 ///
 /// The blob upload triggers BlobIngestTriggerFunction automatically, so no manual
 /// ingestion step is required after this call.
@@ -39,24 +38,25 @@ public sealed class AdminDocumentUploadFunction
     private static readonly JsonSerializerOptions JsonOut =
         new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-    private readonly BlobContainerClient          _container;
+    private readonly BlobContainerClient _container;
     private readonly ILogger<AdminDocumentUploadFunction> _log;
 
-    public AdminDocumentUploadFunction(IConfiguration cfg, ILogger<AdminDocumentUploadFunction> log)
+    public AdminDocumentUploadFunction(ILogger<AdminDocumentUploadFunction> log)
     {
         _log = log;
 
-        var conn      = cfg["BLOB_CONNECTION"]
+        var conn      = Environment.GetEnvironmentVariable("BLOB_CONNECTION")
             ?? throw new InvalidOperationException("BLOB_CONNECTION missing");
-        var container = cfg["BLOB_CONTAINER"]
-            ?? throw new InvalidOperationException("BLOB_CONTAINER missing");
+        var container = Environment.GetEnvironmentVariable("BLOB_CONTAINER")
+                     ?? Environment.GetEnvironmentVariable("INGEST_CONTAINER")
+                     ?? "fortianswer-docs";
 
         _container = new BlobContainerClient(conn, container);
     }
 
     [Function("Admin_DocumentUpload")]
     public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "admin/documents")] HttpRequestData req)
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "documents/upload")] HttpRequestData req)
     {
         var qs   = HttpUtility.ParseQueryString(req.Url.Query);
         var role = qs["role"]?.Trim().ToLowerInvariant();
@@ -75,7 +75,6 @@ public sealed class AdminDocumentUploadFunction
             return await ErrorAsync(req, HttpStatusCode.BadRequest,
                 "BadRequest", $"Unsupported file type '{ext}'. Allowed: .pdf, .docx, .txt, .md");
 
-        // Sanitise: strip path separators from filename
         filename = Path.GetFileName(filename);
 
         var classification = qs["classification"]?.Trim().ToLowerInvariant() ?? "public";
@@ -88,7 +87,6 @@ public sealed class AdminDocumentUploadFunction
         try
         {
             await _container.CreateIfNotExistsAsync();
-
             var blobClient = _container.GetBlobClient(blobPath);
 
             await using var body = req.Body;

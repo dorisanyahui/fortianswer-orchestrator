@@ -15,10 +15,10 @@ The backend exposes four groups of endpoints. As a UI developer, you mainly work
 | Auth | `/api/auth/register`, `/api/auth/login` | User accounts |
 | Chat | `/api/chat` | AI-powered Q&A with escalation |
 | Tickets (Customer) | `POST /api/tickets`, `GET /api/tickets/{id}`, `GET /api/tickets?username=` | Self-service ticket creation and lookup |
-| Tickets (Agent/Admin) | `GET /api/admin/tickets`, `PATCH /api/tickets/{id}` | Full ticket overview and management |
+| Tickets (Agent/Admin) | `GET /api/tickets/all`, `PATCH /api/tickets/{id}` | Full ticket overview and management |
 | Conversations | `GET /api/conversations?username=` | Conversation history per user |
 | Feedback | `POST /api/feedback`, `GET /api/feedback/summary`, `GET /api/feedback/flagged`, `PATCH /api/feedback/{id}/dismiss` | Thumbs up / down rating; Admin analytics |
-| Admin KB Upload | `POST /api/admin/documents` | Admin uploads a document to the knowledge base |
+| Admin KB Upload | `POST /api/documents/upload` | Admin uploads a document to the knowledge base |
 | Health | `GET /api/health` | Dependency health check (Table Storage + Search + Groq) |
 
 ---
@@ -563,7 +563,7 @@ Returns all tickets belonging to the logged-in user, newest first.
 
 ---
 
-### Admin/Agent Ticket Overview — `GET /api/admin/tickets`
+### Admin/Agent Ticket Overview — `GET /api/tickets/all`
 
 For Agent and Admin dashboards. Returns **all tickets** across all users, newest first.
 
@@ -581,10 +581,10 @@ For Agent and Admin dashboards. Returns **all tickets** across all users, newest
 
 **Examples:**
 ```
-GET /api/admin/tickets?role=agent
-GET /api/admin/tickets?role=admin&status=Open&priority=P1
-GET /api/admin/tickets?role=agent&assignedTo=john
-GET /api/admin/tickets?role=admin&page=2&pageSize=20
+GET /api/tickets/all?role=agent
+GET /api/tickets/all?role=admin&status=Open&priority=P1
+GET /api/tickets/all?role=agent&assignedTo=john
+GET /api/tickets/all?role=admin&page=2&pageSize=20
 ```
 
 **Response 200:**
@@ -923,7 +923,7 @@ GET /api/kb/documents?role=admin&classification=internal
 
 ---
 
-## 8. Admin Document Upload — `POST /api/admin/documents`
+## 8. Admin Document Upload — `POST /api/documents/upload`
 
 Allows Admins to upload knowledge base documents directly via API. The uploaded file is stored in blob storage and **ingested automatically** — no separate ingest step needed.
 
@@ -937,7 +937,7 @@ Allows Admins to upload knowledge base documents directly via API. The uploaded 
 
 **Request:**
 ```http
-POST /api/admin/documents?role=admin&classification=internal&filename=vpn-guide.docx
+POST /api/documents/upload?role=admin&classification=internal&filename=vpn-guide.docx
 Content-Type: application/octet-stream
 x-api-key: <your-key>
 
@@ -948,7 +948,7 @@ x-api-key: <your-key>
 ```js
 async function uploadDocument(file, classification = "public") {
   const res = await apiFetch(
-    `/api/admin/documents?role=admin&classification=${classification}&filename=${encodeURIComponent(file.name)}`,
+    `/api/documents/upload?role=admin&classification=${classification}&filename=${encodeURIComponent(file.name)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },

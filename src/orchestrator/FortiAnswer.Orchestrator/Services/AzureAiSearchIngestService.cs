@@ -122,87 +122,59 @@ public sealed class AzureAiSearchIngestService
 
     /// <summary>
     /// Returns a list of distinct documents currently indexed in Azure AI Search.
-    /// Uses facets to count chunks per document, then fetches one chunk per document
-    /// to retrieve classification and createdUtc.
+    /// Fetches all chunks in one query, then groups by path in memory to count chunks
+    /// and deduplicate metadata. Does not require the 'path' field to be facetable.
     /// </summary>
     public async Task<List<KbDocument>> ListDocumentsAsync(CancellationToken ct = default)
     {
-        // Step 1: Use facets to get distinct paths + chunk counts
-        var facetUrl = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
-        var facetBody = new { search = "*", top = 0, facets = new[] { "path,count:1000" } };
-
-        using var facetReq = new HttpRequestMessage(HttpMethod.Post, facetUrl);
-        facetReq.Headers.Add("api-key", _adminKey);
-        facetReq.Content = new StringContent(
-            JsonSerializer.Serialize(facetBody), Encoding.UTF8, "application/json");
-
-        using var facetRes = await _http.SendAsync(facetReq, ct);
-        var facetText = await facetRes.Content.ReadAsStringAsync(ct);
-        if (!facetRes.IsSuccessStatusCode)
-            throw new InvalidOperationException($"KB list (facets) failed: {(int)facetRes.StatusCode} {facetText}");
-
-        // Parse facet results: [{ "value": "public/faq.docx", "count": 12 }, ...]
-        var chunkCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        using (var facetDoc = JsonDocument.Parse(facetText))
-        {
-            if (facetDoc.RootElement.TryGetProperty("@search.facets", out var facets) &&
-                facets.TryGetProperty("path", out var pathFacets) &&
-                pathFacets.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var f in pathFacets.EnumerateArray())
-                {
-                    var pathVal  = f.TryGetProperty("value", out var v) ? v.GetString() : null;
-                    var count    = f.TryGetProperty("count", out var c) ? c.GetInt32() : 0;
-                    if (!string.IsNullOrWhiteSpace(pathVal))
-                        chunkCounts[pathVal] = count;
-                }
-            }
-        }
-
-        if (chunkCounts.Count == 0) return [];
-
-        // Step 2: Fetch one chunk per path to get classification + createdUtc
-        var detailUrl = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
-        var detailBody = new
+        var url  = $"{_endpoint}/indexes/{_index}/docs/search?api-version={_apiVersion}";
+        var body = new
         {
             search = "*",
             top    = 1000,
             select = $"{PATH_FIELD},source,classification,createdUtc"
         };
 
-        using var detailReq = new HttpRequestMessage(HttpMethod.Post, detailUrl);
-        detailReq.Headers.Add("api-key", _adminKey);
-        detailReq.Content = new StringContent(
-            JsonSerializer.Serialize(detailBody), Encoding.UTF8, "application/json");
+        using var req = new HttpRequestMessage(HttpMethod.Post, url);
+        req.Headers.Add("api-key", _adminKey);
+        req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-        using var detailRes = await _http.SendAsync(detailReq, ct);
-        var detailText = await detailRes.Content.ReadAsStringAsync(ct);
-        if (!detailRes.IsSuccessStatusCode)
-            throw new InvalidOperationException($"KB list (details) failed: {(int)detailRes.StatusCode} {detailText}");
+        using var res = await _http.SendAsync(req, ct);
+        var text = await res.Content.ReadAsStringAsync(ct);
+        if (!res.IsSuccessStatusCode)
+            throw new InvalidOperationException($"KB list failed: {(int)res.StatusCode} {text}");
 
-        // Deduplicate — keep first occurrence per path
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var docs  = new List<KbDocument>();
+        // Group by path in memory: count chunks, keep first occurrence for metadata
+        var chunkCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var metadata    = new Dictionary<string, KbDocument>(StringComparer.OrdinalIgnoreCase);
 
-        using var detailDoc = JsonDocument.Parse(detailText);
-        if (detailDoc.RootElement.TryGetProperty("value", out var items) &&
+        using var doc = JsonDocument.Parse(text);
+        if (doc.RootElement.TryGetProperty("value", out var items) &&
             items.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in items.EnumerateArray())
             {
                 var path = item.TryGetProperty(PATH_FIELD, out var p) ? p.GetString() : null;
-                if (string.IsNullOrWhiteSpace(path) || !seen.Add(path)) continue;
+                if (string.IsNullOrWhiteSpace(path)) continue;
 
-                docs.Add(new KbDocument
+                chunkCounts[path] = chunkCounts.GetValueOrDefault(path) + 1;
+
+                if (!metadata.ContainsKey(path))
                 {
-                    Path           = path,
-                    Source         = item.TryGetProperty("source",         out var src)  ? src.GetString()  ?? "" : "",
-                    Classification = item.TryGetProperty("classification", out var cls)  ? cls.GetString()  ?? "" : "",
-                    CreatedUtc     = item.TryGetProperty("createdUtc",     out var crt)  ? crt.GetString()  ?? "" : "",
-                    ChunkCount     = chunkCounts.TryGetValue(path, out var cnt) ? cnt : 0
-                });
+                    metadata[path] = new KbDocument
+                    {
+                        Path           = path,
+                        Source         = item.TryGetProperty("source",         out var src) ? src.GetString() ?? "" : "",
+                        Classification = item.TryGetProperty("classification", out var cls) ? cls.GetString() ?? "" : "",
+                        CreatedUtc     = item.TryGetProperty("createdUtc",     out var crt) ? crt.GetString() ?? "" : "",
+                    };
+                }
             }
         }
+
+        var docs = metadata.Values.ToList();
+        foreach (var d in docs)
+            d.ChunkCount = chunkCounts.GetValueOrDefault(d.Path);
 
         docs.Sort((a, b) => string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase));
         return docs;
