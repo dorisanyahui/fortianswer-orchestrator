@@ -121,6 +121,21 @@ GET /api/tickets/all?role=admin
 }
 ```
 
+**JS 示例：**
+```js
+// 获取第一页（默认 20 条）
+const res = await apiFetch(`/api/tickets/all?role=${currentRole}`);
+const data = await res.json();
+// data.tickets    — 当前页 ticket 数组
+// data.total      — 总条数
+// data.totalPages — 总页数
+
+// 带筛选 + 翻页
+const res = await apiFetch(
+  `/api/tickets/all?role=${currentRole}&status=Open&priority=P1&page=2&pageSize=20`
+);
+```
+
 **你需要做：** Agent/Admin 登录后显示这个列表页，支持按 status 和 priority 筛选，加分页控件。
 
 ---
@@ -436,7 +451,60 @@ async function uploadDocument(file, classification = "public") {
 
 ---
 
-## 9. 新增：Health Check 加依赖检测
+## 9. 新增：Admin 删除知识库文档
+
+### 改了什么
+新增 `DELETE /api/documents/delete` — **一步同时删除 blob 和 Search Index**。
+
+> 为什么要一个接口两件事？`GET /api/kb/documents` 数据来自 Search Index，不是 blob。单独从 Azure Portal 删 blob，Search Index 里还在，列表就还会显示。这个接口帮你两个都清掉。
+
+### 接口
+
+```
+DELETE /api/documents/delete?role=admin&path=public/vpn-guide.docx
+x-api-key: ...
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `role` | 是 | 必须是 `admin` |
+| `path` | 是 | 完整 blob 路径，如 `public/vpn-guide.docx` |
+
+**Response 200：**
+```json
+{
+  "ok": true,
+  "path": "public/vpn-guide.docx",
+  "blobDeleted": true,
+  "chunksDeleted": 3
+}
+```
+
+- `blobDeleted` — blob 是否成功删除（如果已经不存在为 false，不影响结果）
+- `chunksDeleted` — 从 Search Index 删除的 chunk 数量
+
+### JS 示例
+
+```js
+async function deleteDocument(blobPath) {
+  const res = await apiFetch(
+    `/api/documents/delete?role=admin&path=${encodeURIComponent(blobPath)}`,
+    { method: "DELETE" }
+  );
+
+  const data = await res.json();
+  if (data.ok) {
+    // 刷新文档列表
+    await loadKbDocuments();
+  }
+}
+```
+
+**你需要做：** KB 文档列表每行加一个删除按钮，点击后调上面的接口，完成后刷新列表。建议加确认弹窗防误操作。
+
+---
+
+## 10. 新增：Health Check 加依赖检测
 
 ### 改了什么
 `GET /api/health` 以前只返回 `{"status":"ok"}`，现在会实际检测 Table Storage、Azure AI Search、Groq API key 三个依赖。
@@ -495,6 +563,7 @@ async function uploadDocument(file, classification = "public") {
 | Admin dashboard 加满意率卡片（用 `fileName` 显示文档名） | `GET /api/feedback/summary` | 🟡 中 |
 | Admin dashboard 加待审核列表 | `GET /api/feedback/flagged` + dismiss | 🟡 中 |
 | Admin KB 文档页加上传功能 | `POST /api/documents/upload` | 🟡 中 |
+| Admin KB 文档页加删除按钮 | `DELETE /api/documents/delete` | 🟡 中 |
 | 加 429 错误处理 | 限流 | 🟢 低 |
 | Admin 面板状态指示灯（可选） | `GET /api/health` | 🟢 低 |
 
@@ -513,4 +582,3 @@ async function uploadDocument(file, classification = "public") {
 
 ---
 
-有问题找 Doris。
