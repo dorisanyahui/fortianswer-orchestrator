@@ -26,21 +26,27 @@ AI-powered security incident response assistant built on Azure Functions. Accept
 
 ```
 Web UI / REST Client
-        │
+        │  (x-api-key header required on all requests)
         ▼
-Azure Functions (this repo)
+Azure Functions (this repo)  ←  API Key Middleware (global auth guard)
         │
         ├── /api/auth/register + /api/auth/login   ← User accounts (Azure Table Storage)
+        │
         ├── /api/chat                               ← Main AI pipeline
-        │       ├── Azure AI Search (retrieval)
-        │       ├── Groq LLM (generation)
+        │       ├── Azure AI Search (retrieval — role-filtered, hybrid)
+        │       ├── Tavily Web Search (fallback when KB has no match)
+        │       ├── Groq LLM — llama-3.3-70b (generation, multi-turn history)
         │       ├── Slot Session Service (Azure Table Storage)
         │       └── Tickets Table Service (Azure Table Storage)
-        ├── /api/tickets                            ← CRUD for escalation tickets
+        │
+        ├── /api/tickets + /api/tickets/all         ← Ticket CRUD + Agent/Admin overview
+        ├── /api/feedback                           ← User ratings + Admin satisfaction analytics
+        ├── /api/kb/documents                       ← Knowledge base document listing
         ├── /api/conversations                      ← Conversation history
-        └── /api/ingest                             ← Manual document ingestion trigger
+        │
+        └── /api/documents + /api/ingest            ← Document management
                 ├── Azure Blob Storage (document source)
-                ├── OpenAI Embeddings
+                ├── OpenAI Embeddings (text-embedding-3-small)
                 └── Azure AI Search (indexing)
 ```
 
@@ -64,18 +70,35 @@ Azure Functions (this repo)
 |---|---|---|
 | POST | `/api/tickets` | Manually create a ticket |
 | GET | `/api/tickets/{id}` | Get a ticket by ID |
-| GET | `/api/tickets?username=` | List all tickets for a user |
+| GET | `/api/tickets?username=` | List all tickets for a user (customer self-service) |
+| GET | `/api/tickets/all?role=` | Full ticket overview with filters + pagination (agent/admin) |
+| PATCH | `/api/tickets/{id}?role=` | Update status / assignedTo / priority (agent/admin) |
+
+### Feedback
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/feedback` | Submit thumbs up/down rating with issueType + citations |
+| GET | `/api/feedback/summary?role=admin` | Satisfaction stats — overall + by issue type + by document |
+| GET | `/api/feedback/flagged?role=admin` | List low-rated unreviewed responses |
+| PATCH | `/api/feedback/{requestId}/dismiss?role=admin` | Mark flagged response as reviewed |
+
+### Knowledge Base
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/kb/documents?role=` | List all indexed documents with classification + chunk count |
+| POST | `/api/documents/upload?role=admin` | Upload a document — auto-triggers ingestion |
+| DELETE | `/api/documents/delete?role=admin` | Delete document from blob storage + search index |
 
 ### Conversations
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/conversations?username=` | Get chat history for a user |
 
-### Ingestion
+### Ingestion & Ops
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/ingest` | Trigger manual document ingestion |
-| GET | `/api/health` | Health check |
+| GET | `/api/health` | Health check — verifies Table Storage, Search, and Groq |
 
 > Full request/response schema, field descriptions, and worked examples are in [`docs/ui-integration-guide.md`](docs/ui-integration-guide.md).
 
@@ -275,37 +298,51 @@ Documents are stored in Azure Blob Storage, chunked, embedded (OpenAI `text-embe
 ```
 fortianswer-orchestrator/
 ├── src/orchestrator/FortiAnswer.Orchestrator/
-│   ├── ChatFunction.cs                  ← Main chat endpoint
+│   ├── ChatFunction.cs                      ← Main chat endpoint
 │   ├── AuthRegisterFunction.cs
 │   ├── AuthLoginFunction.cs
 │   ├── TicketCreateFunction.cs
 │   ├── TicketGetFunction.cs
 │   ├── TicketListFunction.cs
+│   ├── TicketAdminListFunction.cs           ← Agent/Admin ticket overview + pagination
+│   ├── TicketUpdateFunction.cs              ← PATCH status / assignedTo / priority
+│   ├── FeedbackFunction.cs                  ← Submit ratings
+│   ├── FeedbackQueryFunction.cs             ← Summary / flagged / dismiss
+│   ├── KbDocumentsFunction.cs               ← KB document listing
+│   ├── AdminDocumentUploadFunction.cs       ← Upload doc → auto ingestion
+│   ├── AdminDocumentDeleteFunction.cs       ← Delete doc from blob + search index
 │   ├── ConversationListFunction.cs
 │   ├── IngestFunction.cs
 │   ├── BlobIngestTriggerFunction.cs
 │   ├── BlobDeletedEventGridTriggerFunction.cs
-│   ├── HealthFunction.cs
+│   ├── SlotSessionCleanupFunction.cs        ← Timer: daily cleanup of stale sessions
+│   ├── HealthFunction.cs                    ← Dependency health check
+│   ├── Middleware/
+│   │   └── ApiKeyMiddleware.cs              ← Global x-api-key guard
 │   ├── Models/
-│   │   ├── ChatModels.cs                ← Request/response types
-│   │   └── SlotModels.cs                ← Slot filling types
+│   │   ├── ChatModels.cs                    ← Request/response types
+│   │   └── SlotModels.cs                    ← Slot filling types
 │   └── Services/
-│       ├── RetrievalService.cs          ← Azure AI Search retrieval
-│       ├── GroqClient.cs                ← LLM calls
-│       ├── PromptBuilder.cs             ← Prompt construction
-│       ├── SlotDefinitions.cs           ← Per-issueType question lists
-│       ├── SlotSessionService.cs        ← Slot session state (Table Storage)
-│       ├── TicketsTableService.cs       ← Ticket CRUD (Table Storage)
-│       ├── TableStorageService.cs       ← Conversation logging
-│       ├── UsersTableService.cs         ← User accounts
-│       ├── WebSearchService.cs          ← Web search fallback
-│       ├── IngestionOrchestrator.cs     ← Document ingestion pipeline
-│       └── AzureAiSearchIngestService.cs
+│       ├── RetrievalService.cs              ← Azure AI Search retrieval
+│       ├── GroqClient.cs                    ← LLM calls (single + multi-turn history)
+│       ├── PromptBuilder.cs                 ← System + user prompt construction
+│       ├── SlotDefinitions.cs               ← Per-issueType question lists
+│       ├── SlotSessionService.cs            ← Slot session state (Table Storage)
+│       ├── TicketsTableService.cs           ← Ticket CRUD (Table Storage)
+│       ├── FeedbackTableService.cs          ← Feedback storage + analytics
+│       ├── TableStorageService.cs           ← Conversation logging + turn history
+│       ├── UsersTableService.cs             ← User accounts
+│       ├── WebSearchService.cs              ← Tavily web search fallback
+│       ├── IngestionOrchestrator.cs         ← Document ingestion pipeline
+│       └── AzureAiSearchIngestService.cs    ← Vector indexing + document listing
 ├── tests/
-│   ├── Localtest.http                   ← Local dev REST tests
-│   └── requests.http                    ← Production REST tests
+│   ├── FortiAnswer.Orchestrator.Tests/      ← 77 xUnit unit tests
+│   ├── Localtest.http                       ← Local dev REST tests
+│   └── requests.http                        ← Production REST tests
 └── docs/
-    └── ui-integration-guide.md          ← Full API reference for UI team
+    ├── ui-integration-guide.md              ← Full API reference for UI team
+    ├── sprint3-backend-changes-for-li.md    ← Sprint 3 change summary (Chinese)
+    └── demo-ppt-outline.md                  ← Capstone demo presentation outline
 ```
 
 ---
@@ -324,4 +361,11 @@ fortianswer-orchestrator/
 | 2 | US8 | Conversation history | ✅ Done |
 | 2 | US9 | Slot filling — guided incident intake | ✅ Done |
 | 2 | US10 | Document ingestion pipeline (PDF/DOCX) | ✅ Done |
-| 2 | –   | Web search fallback | ✅ Done |
+| 2 | –   | Web search fallback (Tavily) | ✅ Done |
+| 3 | US17 | User feedback (👍👎 + satisfaction analytics) | ✅ Done |
+| 3 | –   | Agent/Admin ticket dashboard + pagination | ✅ Done |
+| 3 | –   | Multi-turn conversation memory (LLM history) | ✅ Done |
+| 3 | –   | KB document list + Admin upload + delete | ✅ Done |
+| 3 | –   | API Key protection + rate limiting | ✅ Done |
+| 3 | –   | Health check with dependency pings | ✅ Done |
+| 3 | –   | Slot session auto-cleanup (Timer Trigger) | ✅ Done |
