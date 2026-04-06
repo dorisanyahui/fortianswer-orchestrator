@@ -1,175 +1,379 @@
 # FortiAnswer Orchestrator
 
-AI-powered security incident response assistant built on Azure Functions. Accepts natural language questions from service desk agents and end users, retrieves relevant knowledge from a secured knowledge base, and either answers directly or escalates to a structured ticket with full context.
+AI-powered security incident response assistant built with **C#**, **.NET 8**, and **Azure Functions**.
+It accepts natural-language questions from service desk agents and end users, retrieves relevant knowledge from a secured knowledge base, and either answers directly or escalates the case into a structured support ticket with full context.
 
-**Production URL:** `https://func-fortianswer-gccvakhgayenbdak.canadacentral-01.azurewebsites.net`
+> This project demonstrates **backend engineering**, **cloud integration**, **AI orchestration**, and **workflow automation** in an enterprise support scenario.
 
 ---
 
-## What It Does
+## Overview
+
+FortiAnswer Orchestrator is a cloud-based backend project designed for security support workflows.
+
+It combines:
+
+- **Natural-language question answering**
+- **Role-based knowledge retrieval**
+- **Automatic ticket escalation**
+- **Guided incident intake**
+- **Document ingestion and indexing**
+- **Feedback analytics and conversation history**
+
+The goal is to reduce manual triage effort, improve response consistency, and ensure that higher-risk or restricted issues are handled through the right escalation path.
+
+---
+
+## Why This Project Matters
+
+In real support environments, users often ask questions in free-form language, while support teams still need:
+
+- controlled access to sensitive information
+- reliable retrieval from internal knowledge sources
+- structured tickets for actionable incidents
+- traceable conversation history
+- consistent handling of urgent or restricted cases
+
+FortiAnswer Orchestrator was built to address that gap by combining **LLM-assisted responses** with **retrieval**, **role enforcement**, and **workflow automation**.
+
+---
+
+## Key Highlights
+
+- **AI-powered Q&A** using Azure AI Search retrieval plus Groq LLM generation
+- **Role-based access control** across Public / Internal / Confidential knowledge tiers
+- **Automatic escalation** for restricted or high-severity requests
+- **Slot filling workflow** for guided multi-turn incident intake before ticket creation
+- **Web search fallback** when no internal knowledge base match is available
+- **Ticket management** with create, view, list, and admin overview flows
+- **Conversation history logging** for traceability and user context
+- **Document ingestion pipeline** for PDF and DOCX files
+- **Feedback analytics** for response quality monitoring
+- **77 xUnit unit tests** plus local and deployed HTTP endpoint testing
+
+---
+
+## Tech Stack
+
+### Backend
+- **C#**
+- **.NET 8**
+- **Azure Functions**
+
+### Cloud & Storage
+- **Azure Table Storage**
+- **Azure Blob Storage**
+- **Azure AI Search**
+
+### AI / Search
+- **Groq LLM**
+- **Azure AI Search** for retrieval
+- **OpenAI Embeddings** (`text-embedding-3-small`)
+- **Tavily Web Search** for fallback lookup
+
+### Dev Workflow
+- **GitHub Actions**
+- **xUnit**
+- **REST Client / HTTP test files**
+
+---
+
+## Core Capabilities
 
 | Capability | Description |
 |---|---|
-| **AI Q&A** | Answers security questions using Azure AI Search + Groq LLM |
-| **Role-based access** | Customer / Agent / Admin roles each see different knowledge tiers |
-| **Auto escalation** | Restricted / high-severity requests automatically create tickets |
-| **Slot filling (US9)** | Guided multi-turn intake collects structured incident details before creating a ticket |
-| **Web search fallback** | When the internal KB has no match, user can confirm a live web search |
-| **Ticket management** | Create, view, and list tickets; linked to conversation sessions |
-| **Conversation history** | Every chat turn is logged and retrievable per user |
-| **Auth** | Username/password user accounts with role enforcement |
-| **Document ingestion** | Upload PDF/DOCX to Blob Storage → auto-chunked, embedded, indexed |
+| **AI Q&A** | Answers security-related questions using retrieval + LLM generation |
+| **Role-based access** | Customer / Agent / Admin roles see different knowledge boundaries |
+| **Auto escalation** | High-severity or restricted requests create structured support tickets |
+| **Slot filling** | Guided follow-up questions collect the details needed for better tickets |
+| **Web search fallback** | Allows confirmed live web lookup when the internal KB has no match |
+| **Ticket management** | Create, retrieve, list, and manage tickets |
+| **Conversation history** | Logs each turn for auditability and continuity |
+| **Authentication** | Username/password login with role enforcement |
+| **Document ingestion** | Upload PDF/DOCX → chunk → embed → index into Azure AI Search |
+| **Feedback analytics** | Collects user ratings and exposes admin reporting endpoints |
 
 ---
 
 ## Architecture
 
-```
+```text
 Web UI / REST Client
-        │  (x-api-key header required on all requests)
+        │
+        │  x-api-key required on all requests
         ▼
-Azure Functions (this repo)  ←  API Key Middleware (global auth guard)
+Azure Functions (this repo)
         │
-        ├── /api/auth/register + /api/auth/login   ← User accounts (Azure Table Storage)
+        ├── API Key Middleware
         │
-        ├── /api/chat                               ← Main AI pipeline
-        │       ├── Azure AI Search (retrieval — role-filtered, hybrid)
-        │       ├── Tavily Web Search (fallback when KB has no match)
-        │       ├── Groq LLM — llama-3.3-70b (generation, multi-turn history)
-        │       ├── Slot Session Service (Azure Table Storage)
-        │       └── Tickets Table Service (Azure Table Storage)
+        ├── /api/auth/register
+        ├── /api/auth/login
         │
-        ├── /api/tickets + /api/tickets/all         ← Ticket CRUD + Agent/Admin overview
-        ├── /api/feedback                           ← User ratings + Admin satisfaction analytics
-        ├── /api/kb/documents                       ← Knowledge base document listing
-        ├── /api/conversations                      ← Conversation history
+        ├── /api/chat
+        │      ├── Azure AI Search (role-filtered retrieval)
+        │      ├── Groq LLM (generation + multi-turn context)
+        │      ├── Tavily Web Search (fallback)
+        │      ├── Slot Session Service (Azure Table Storage)
+        │      └── Tickets Table Service (Azure Table Storage)
         │
-        └── /api/documents + /api/ingest            ← Document management
-                ├── Azure Blob Storage (document source)
-                ├── OpenAI Embeddings (text-embedding-3-small)
-                └── Azure AI Search (indexing)
+        ├── /api/tickets
+        ├── /api/tickets/all
+        ├── /api/feedback
+        ├── /api/kb/documents
+        ├── /api/conversations
+        │
+        └── /api/documents + /api/ingest
+               ├── Azure Blob Storage
+               ├── OpenAI Embeddings
+               └── Azure AI Search Index
 ```
 
 ---
 
-## API Endpoints
+## How the Chat Pipeline Works
 
-### Auth
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/auth/register` | Create a new user account |
-| POST | `/api/auth/login` | Authenticate and get user role |
-
-### Chat
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/chat` | Send a message — returns AI answer, escalation, or slot filling prompt |
-
-### Tickets
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/tickets` | Manually create a ticket |
-| GET | `/api/tickets/{id}` | Get a ticket by ID |
-| GET | `/api/tickets?username=` | List all tickets for a user (customer self-service) |
-| GET | `/api/tickets/all?role=` | Full ticket overview with filters + pagination (agent/admin) |
-| PATCH | `/api/tickets/{id}?role=` | Update status / assignedTo / priority (agent/admin) |
-
-### Feedback
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/feedback` | Submit thumbs up/down rating with issueType + citations |
-| GET | `/api/feedback/summary?role=admin` | Satisfaction stats — overall + by issue type + by document |
-| GET | `/api/feedback/flagged?role=admin` | List low-rated unreviewed responses |
-| PATCH | `/api/feedback/{requestId}/dismiss?role=admin` | Mark flagged response as reviewed |
-
-### Knowledge Base
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/kb/documents?role=` | List all indexed documents with classification + chunk count |
-| POST | `/api/documents/upload?role=admin` | Upload a document — auto-triggers ingestion |
-| DELETE | `/api/documents/delete?role=admin` | Delete document from blob storage + search index |
-
-### Conversations
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/conversations?username=` | Get chat history for a user |
-
-### Ingestion & Ops
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/ingest` | Trigger manual document ingestion |
-| GET | `/api/health` | Health check — verifies Table Storage, Search, and Groq |
-
-> Full request/response schema, field descriptions, and worked examples are in [`docs/ui-integration-guide.md`](docs/ui-integration-guide.md).
-
----
-
-## Chat Pipeline
-
-```
+```text
 POST /api/chat
         │
         ▼
-1. Validate request (role, issueType, dataBoundary)
+1. Validate request
+   - role
+   - issueType
+   - dataBoundary
         │
         ▼
-2. Is this a Restricted or high-severity request?
-   ├── Admin    → Direct explanation, no ticket
-   └── Others   → Does issueType have slot definitions?
-                   ├── Yes → Slot filling (guided multi-turn intake)
-                   │         After final answer → create ticket
-                   └── No  → Create ticket immediately
+2. Check whether request is restricted or high severity
+   ├── Admin → explain directly
+   └── Others
+         ├── if slot definitions exist → guided slot filling
+         └── otherwise → immediate ticket creation
         │
         ▼
-3. Normal flow: Retrieve from Azure AI Search → Build prompt → Call Groq LLM
+3. Normal flow
+   Retrieve from Azure AI Search
+   → build prompt
+   → call Groq LLM
         │
         ▼
-4. Web search fallback (if KB returns no results for Public queries)
+4. Optional web search fallback
+   if internal KB returns no relevant result
         │
         ▼
-5. Log conversation turn → Return structured response
+5. Log conversation turn
+   and return structured response
 ```
-
-### Role → Data Boundary
-
-| Role | Max data boundary | Can see |
-|---|---|---|
-| Customer | Public | Public KB only |
-| Agent | Internal | Public + Internal KB |
-| Admin | Confidential | Public + Internal + Confidential |
-
-### Issue Type → Priority
-
-| Issue Type | Priority | Always Escalates? |
-|---|---|---|
-| Phishing, SuspiciousLogin, Severity | P1 Critical | Yes (SuspiciousLogin, Severity always force Restricted) |
-| EndpointAlert, AccountLockout | P2 High | No |
-| VPN, MFA, PasswordReset | P3 Medium | No |
-| General | P4 Low | No |
-
-### `next.action` Values (UI-facing)
-
-| Value | Meaning |
-|---|---|
-| `none` | Normal answer — display response |
-| `escalate` | Ticket created — show ticket banner with `ticketId` |
-| `slot_filling` | Guided mode — show `slotFilling.nextQuestion` to user |
 
 ---
 
-## Slot Filling (US9)
+## Role and Data Boundary Model
 
-For high-priority issue types, the bot asks structured follow-up questions one at a time before creating the ticket. This ensures tickets are complete and actionable on arrival.
+| Role | Max Data Boundary | Access Scope |
+|---|---|---|
+| **Customer** | Public | Public KB only |
+| **Agent** | Internal | Public + Internal KB |
+| **Admin** | Confidential | Public + Internal + Confidential KB |
 
-Questions per issue type:
+This ensures that retrieval results are filtered according to the requesting user's permitted knowledge tier.
+
+---
+
+## Issue Priority Model
+
+| Issue Type | Priority | Always Escalates? |
+|---|---|---|
+| **Phishing** | P1 Critical | Yes |
+| **SuspiciousLogin** | P1 Critical | Yes |
+| **Severity** | P1 Critical | Yes |
+| **EndpointAlert** | P2 High | No |
+| **AccountLockout** | P2 High | No |
+| **VPN** | P3 Medium | No |
+| **MFA** | P3 Medium | No |
+| **PasswordReset** | P3 Medium | No |
+| **General** | P4 Low | No |
+
+---
+
+## Slot Filling Workflow
+
+For selected issue types, the system does not immediately create a ticket.
+Instead, it asks a guided sequence of follow-up questions to collect complete and actionable incident details.
+
+### Current question counts
 
 | Issue Type | Questions |
 |---|---|
-| Phishing, SuspiciousLogin, VPN, MFA, EndpointAlert | 4 |
-| AccountLockout, PasswordReset | 3 |
-| General, Severity | 0 (no slot filling) |
+| **Phishing** | 4 |
+| **SuspiciousLogin** | 4 |
+| **VPN** | 4 |
+| **MFA** | 4 |
+| **EndpointAlert** | 4 |
+| **AccountLockout** | 3 |
+| **PasswordReset** | 3 |
+| **General** | 0 |
+| **Severity** | 0 |
 
-Session state is stored in Azure Table Storage keyed by `conversationId`. The UI must send the **same `conversationId`** on every turn of a session.
+Session state is stored in **Azure Table Storage** and keyed by `conversationId`.
+The client must reuse the same `conversationId` across the same guided session.
+
+---
+
+## API Overview
+
+### Auth
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/auth/register` | Create a new user account |
+| POST | `/api/auth/login` | Authenticate and return user role |
+
+### Chat
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/chat` | Submit a message and receive an answer, escalation, or slot-filling prompt |
+
+### Tickets
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/tickets` | Manually create a ticket |
+| GET | `/api/tickets/{id}` | Get ticket by ID |
+| GET | `/api/tickets?username=` | List tickets for a user |
+| GET | `/api/tickets/all?role=` | Full overview for agent/admin users |
+| PATCH | `/api/tickets/{id}?role=` | Update status, assignee, or priority |
+
+### Feedback
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/feedback` | Submit thumbs up/down feedback |
+| GET | `/api/feedback/summary?role=admin` | View satisfaction metrics |
+| GET | `/api/feedback/flagged?role=admin` | View flagged low-rated responses |
+| PATCH | `/api/feedback/{requestId}/dismiss?role=admin` | Mark flagged response as reviewed |
+
+### Knowledge Base
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/kb/documents?role=` | List indexed documents |
+| POST | `/api/documents/upload?role=admin` | Upload document and trigger ingestion |
+| DELETE | `/api/documents/delete?role=admin` | Delete document from storage and search index |
+
+### Conversations
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/conversations?username=` | Retrieve chat history for a user |
+
+### Ingestion & Ops
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/ingest` | Trigger manual ingestion |
+| GET | `/api/health` | Health check for core dependencies |
+
+> Full request and response details can be documented separately in `docs/ui-integration-guide.md`.
+
+---
+
+## Example Use Cases
+
+### 1. Self-service knowledge question
+A customer asks how to reset VPN access.
+The system retrieves role-allowed documentation, generates an answer, and returns a normal response.
+
+### 2. High-risk incident report
+A customer reports a suspicious login.
+The system identifies a high-priority issue, begins guided slot filling, and creates a ticket once intake is complete.
+
+### 3. Missing internal KB result
+A user asks a question not covered in the internal knowledge base.
+The system can offer a confirmed web search fallback before returning a final answer.
+
+---
+
+## Document Ingestion Pipeline
+
+Documents are stored in **Azure Blob Storage**, chunked, embedded, and indexed into **Azure AI Search**.
+
+### Supported formats
+- PDF
+- DOCX
+
+### Ingestion flow
+1. Upload document
+2. Store in Blob Storage
+3. Chunk text content
+4. Generate embeddings
+5. Index vectors and metadata in Azure AI Search
+
+### Trigger options
+- **Blob event trigger** after upload
+- **Manual ingestion** through `POST /api/ingest`
+- **Delete trigger** to remove indexed vectors when a file is removed
+
+### Data boundary tagging
+Each document is tagged with a `dataBoundary` value:
+- `Public`
+- `Internal`
+- `Confidential`
+
+Retrieval always filters results by the requesting user's allowed access level.
+
+---
+
+## My Contributions
+
+This project was built to demonstrate my ability to design and implement a practical cloud backend for AI-assisted support workflows.
+
+My contributions include:
+
+- Designing the overall backend architecture and workflow boundaries
+- Building Azure Functions-based API endpoints in C#
+- Implementing role-based retrieval and escalation logic
+- Adding guided slot-filling flows for structured incident intake
+- Building ticket, feedback, conversation, and document management endpoints
+- Integrating Azure AI Search, Blob Storage, Table Storage, and LLM services
+- Writing and organizing tests, local HTTP test flows, and project documentation
+
+---
+
+## Project Structure
+
+```text
+fortianswer-orchestrator/
+├── src/orchestrator/FortiAnswer.Orchestrator/
+│   ├── ChatFunction.cs
+│   ├── AuthRegisterFunction.cs
+│   ├── AuthLoginFunction.cs
+│   ├── TicketCreateFunction.cs
+│   ├── TicketGetFunction.cs
+│   ├── TicketListFunction.cs
+│   ├── TicketAdminListFunction.cs
+│   ├── TicketUpdateFunction.cs
+│   ├── FeedbackFunction.cs
+│   ├── FeedbackQueryFunction.cs
+│   ├── KbDocumentsFunction.cs
+│   ├── AdminDocumentUploadFunction.cs
+│   ├── AdminDocumentDeleteFunction.cs
+│   ├── ConversationListFunction.cs
+│   ├── IngestFunction.cs
+│   ├── BlobIngestTriggerFunction.cs
+│   ├── BlobDeletedEventGridTriggerFunction.cs
+│   ├── SlotSessionCleanupFunction.cs
+│   ├── HealthFunction.cs
+│   ├── Middleware/
+│   ├── Models/
+│   └── Services/
+├── tests/
+│   ├── FortiAnswer.Orchestrator.Tests/
+│   ├── Localtest.http
+│   └── requests.http
+└── docs/
+    ├── ui-integration-guide.md
+    ├── sprint3-backend-changes-for-li.md
+    └── demo-ppt-outline.md
+```
 
 ---
 
@@ -177,27 +381,27 @@ Session state is stored in Azure Table Storage keyed by `conversationId`. The UI
 
 ### Prerequisites
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download)
-- [Azure Functions Core Tools v4](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local)
-- (Optional) [Azurite](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite) for local storage emulation
+- **.NET 8 SDK**
+- **Azure Functions Core Tools v4**
+- **Azurite** (optional, for local storage emulation)
 
-### 1. Navigate to the Function App
+### Run locally
 
 ```bash
 cd src/orchestrator/FortiAnswer.Orchestrator
-```
-
-### 2. Configure local settings
-
-```bash
 cp local.settings.template.json local.settings.json
+func start
 ```
 
-`local.settings.json` is git-ignored — do **not** commit it.
+### Health check
 
-#### Stub mode (no secrets required)
+```text
+GET http://localhost:7071/api/health
+```
 
-By default the app runs in stub mode — no Azure credentials needed:
+### Stub mode
+
+Use stub mode when running without real Azure or LLM credentials:
 
 ```json
 {
@@ -208,7 +412,9 @@ By default the app runs in stub mode — no Azure credentials needed:
 }
 ```
 
-#### Full mode (real Azure services)
+### Full mode
+
+Use full mode when connecting to real services:
 
 ```json
 {
@@ -232,140 +438,75 @@ By default the app runs in stub mode — no Azure credentials needed:
 }
 ```
 
-### 3. Run
-
-```bash
-func start
-```
-
-### 4. Verify
-
-```
-GET http://localhost:7071/api/health
-```
-
 ---
 
 ## Testing
 
-### Local HTTP tests
+### Unit tests
+- **77 xUnit unit tests** are included in the test project
 
-Open [`tests/Localtest.http`](tests/Localtest.http) in VS Code (REST Client extension) — covers all endpoints including slot filling flows.
+### HTTP endpoint testing
+- `tests/Localtest.http` for local testing
+- `tests/requests.http` for deployed environment testing
 
-### Deployed environment tests
+### Sample smoke test flow
 
-Open [`tests/requests.http`](tests/requests.http) — points to the production URL.
-
-### Quick smoke test sequence (local)
-
-```bash
-# 1. Register
-POST http://localhost:7071/api/auth/register
-{ "username": "testuser", "password": "P@ssw0rd123", "role": "Customer" }
-
-# 2. Normal chat
-POST http://localhost:7071/api/chat
-{ "message": "How do I reset my VPN password?", "issueType": "VPN", "userRole": "Customer", "username": "testuser", "conversationId": "conv-001" }
-
-# 3. Slot filling (SuspiciousLogin — 5 turns)
-POST http://localhost:7071/api/chat
-{ "message": "Someone logged in from China at 3am.", "issueType": "SuspiciousLogin", "userRole": "Customer", "username": "testuser", "conversationId": "conv-002" }
-# → next.action == "slot_filling" — answer the 4 follow-up questions with the same conv-002
-
-# 4. List tickets
-GET http://localhost:7071/api/tickets?username=testuser
+```text
+1. Register a user
+2. Submit a normal chat request
+3. Submit a high-priority issue that triggers slot filling
+4. Verify ticket creation and listing
 ```
 
 ---
 
-## Document Ingestion
+## Future Improvements
 
-Documents are stored in Azure Blob Storage, chunked, embedded (OpenAI `text-embedding-3-small`), and indexed in Azure AI Search.
+Potential next steps for the project include:
 
-**Trigger options:**
-- **Blob event** — upload a file to the configured container; an Event Grid trigger fires automatically
-- **Manual** — `POST /api/ingest` with a payload specifying the blob path
-- **Delete** — delete a blob; a separate Event Grid trigger removes the vectors from the index
-
-**Supported formats:** PDF, DOCX
-
-**Data boundary tagging:** Documents are tagged at ingestion time with a `dataBoundary` metadata field (`Public` / `Internal` / `Confidential`). Retrieval queries always filter by the requesting user's allowed boundary.
-
----
-
-## Project Structure
-
-```
-fortianswer-orchestrator/
-├── src/orchestrator/FortiAnswer.Orchestrator/
-│   ├── ChatFunction.cs                      ← Main chat endpoint
-│   ├── AuthRegisterFunction.cs
-│   ├── AuthLoginFunction.cs
-│   ├── TicketCreateFunction.cs
-│   ├── TicketGetFunction.cs
-│   ├── TicketListFunction.cs
-│   ├── TicketAdminListFunction.cs           ← Agent/Admin ticket overview + pagination
-│   ├── TicketUpdateFunction.cs              ← PATCH status / assignedTo / priority
-│   ├── FeedbackFunction.cs                  ← Submit ratings
-│   ├── FeedbackQueryFunction.cs             ← Summary / flagged / dismiss
-│   ├── KbDocumentsFunction.cs               ← KB document listing
-│   ├── AdminDocumentUploadFunction.cs       ← Upload doc → auto ingestion
-│   ├── AdminDocumentDeleteFunction.cs       ← Delete doc from blob + search index
-│   ├── ConversationListFunction.cs
-│   ├── IngestFunction.cs
-│   ├── BlobIngestTriggerFunction.cs
-│   ├── BlobDeletedEventGridTriggerFunction.cs
-│   ├── SlotSessionCleanupFunction.cs        ← Timer: daily cleanup of stale sessions
-│   ├── HealthFunction.cs                    ← Dependency health check
-│   ├── Middleware/
-│   │   └── ApiKeyMiddleware.cs              ← Global x-api-key guard
-│   ├── Models/
-│   │   ├── ChatModels.cs                    ← Request/response types
-│   │   └── SlotModels.cs                    ← Slot filling types
-│   └── Services/
-│       ├── RetrievalService.cs              ← Azure AI Search retrieval
-│       ├── GroqClient.cs                    ← LLM calls (single + multi-turn history)
-│       ├── PromptBuilder.cs                 ← System + user prompt construction
-│       ├── SlotDefinitions.cs               ← Per-issueType question lists
-│       ├── SlotSessionService.cs            ← Slot session state (Table Storage)
-│       ├── TicketsTableService.cs           ← Ticket CRUD (Table Storage)
-│       ├── FeedbackTableService.cs          ← Feedback storage + analytics
-│       ├── TableStorageService.cs           ← Conversation logging + turn history
-│       ├── UsersTableService.cs             ← User accounts
-│       ├── WebSearchService.cs              ← Tavily web search fallback
-│       ├── IngestionOrchestrator.cs         ← Document ingestion pipeline
-│       └── AzureAiSearchIngestService.cs    ← Vector indexing + document listing
-├── tests/
-│   ├── FortiAnswer.Orchestrator.Tests/      ← 77 xUnit unit tests
-│   ├── Localtest.http                       ← Local dev REST tests
-│   └── requests.http                        ← Production REST tests
-└── docs/
-    ├── ui-integration-guide.md              ← Full API reference for UI team
-    ├── sprint3-backend-changes-for-li.md    ← Sprint 3 change summary (Chinese)
-    └── demo-ppt-outline.md                  ← Capstone demo presentation outline
-```
+- stronger authentication and authorization flow
+- RBAC integration with enterprise identity providers
+- richer observability and telemetry dashboards
+- Teams or Power Platform integration
+- admin-facing workflow dashboard
+- more advanced prompt and citation control
+- expanded document classification and governance features
 
 ---
 
-## Sprint Delivery Status
+## Sprint Delivery Summary
 
-| Sprint | User Story | Feature | Status |
-|---|---|---|---|
-| 1 | US1 | Azure Functions project scaffold | ✅ Done |
-| 1 | US2 | Azure AI Search retrieval | ✅ Done |
-| 1 | US3 | Groq LLM integration | ✅ Done |
-| 1 | US4 | Role-based data boundary enforcement | ✅ Done |
-| 1 | US5 | Auto escalation + ticket creation | ✅ Done |
-| 2 | US6 | Auth (register / login) | ✅ Done |
-| 2 | US7 | Ticket management (create / get / list) | ✅ Done |
-| 2 | US8 | Conversation history | ✅ Done |
-| 2 | US9 | Slot filling — guided incident intake | ✅ Done |
-| 2 | US10 | Document ingestion pipeline (PDF/DOCX) | ✅ Done |
-| 2 | –   | Web search fallback (Tavily) | ✅ Done |
-| 3 | US17 | User feedback (👍👎 + satisfaction analytics) | ✅ Done |
-| 3 | –   | Agent/Admin ticket dashboard + pagination | ✅ Done |
-| 3 | –   | Multi-turn conversation memory (LLM history) | ✅ Done |
-| 3 | –   | KB document list + Admin upload + delete | ✅ Done |
-| 3 | –   | API Key protection + rate limiting | ✅ Done |
-| 3 | –   | Health check with dependency pings | ✅ Done |
-| 3 | –   | Slot session auto-cleanup (Timer Trigger) | ✅ Done |
+| Sprint | Feature | Status |
+|---|---|---|
+| Sprint 1 | Azure Functions scaffold | Done |
+| Sprint 1 | Azure AI Search retrieval | Done |
+| Sprint 1 | Groq LLM integration | Done |
+| Sprint 1 | Role-based data boundary enforcement | Done |
+| Sprint 1 | Auto escalation and ticket creation | Done |
+| Sprint 2 | Authentication | Done |
+| Sprint 2 | Ticket management | Done |
+| Sprint 2 | Conversation history | Done |
+| Sprint 2 | Slot filling | Done |
+| Sprint 2 | Document ingestion pipeline | Done |
+| Sprint 2 | Web search fallback | Done |
+| Sprint 3 | Feedback analytics | Done |
+| Sprint 3 | Agent/Admin ticket dashboard | Done |
+| Sprint 3 | Multi-turn conversation memory | Done |
+| Sprint 3 | KB document list, upload, delete | Done |
+| Sprint 3 | API key protection and rate limiting | Done |
+| Sprint 3 | Health check and dependency validation | Done |
+| Sprint 3 | Slot session cleanup | Done |
+
+---
+
+## Notes
+
+For portfolio presentation, this README focuses on:
+
+- business context
+- architecture and engineering decisions
+- technical scope
+- implementation depth
+- maintainability and testing
+
+A deeper endpoint-by-endpoint reference can continue to live under the `docs/` folder.
